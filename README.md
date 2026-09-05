@@ -35,7 +35,8 @@ with Etchv(os.environ["ETCHV_API_KEY"]) as client:
 
 `embed_image` returns PNG bytes, `watermark_id`, and `request_id`.
 `detect_image` returns `watermarked`, `confidence`, `watermark_id` (or `None`),
-and `request_id`. Forensic data must be a non-empty JSON object; the service
+and `request_id`. Read files as bytes and write the returned PNG without re-encoding
+it to preserve the embedded identifier. Forensic data must be a non-empty JSON object; the service
 embeds its SHA-256 digest. Detection recovers the digest, not the original data.
 Input must be encoded image bytes (up to 20 MB); image validation happens server-side.
 
