@@ -8,7 +8,7 @@ ID = 'ab' * 32
 class ClientTests(unittest.TestCase):
     def test_embed_multipart_and_headers(self):
         def handle(request):
-            self.assertEqual(str(request.url), 'https://pilot.api.etchv.com/watermarks/images')
+            self.assertEqual(str(request.url), 'https://api.etchv.com/watermarks/images')
             self.assertEqual(request.headers['x-api-key'], 'test-key')
             self.assertEqual(request.headers['idempotency-key'], 'unique-request')
             body = request.read()

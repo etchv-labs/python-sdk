@@ -34,7 +34,7 @@ class DetectionResult:
 
 
 class Etchv:
-    def __init__(self, api_key: str, *, base_url: str = "https://pilot.api.etchv.com",
+    def __init__(self, api_key: str, *, base_url: str = "https://api.etchv.com",
                  timeout: float = 120, transport: httpx.BaseTransport | None = None):
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("api_key is required")

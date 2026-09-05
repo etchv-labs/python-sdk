@@ -13,7 +13,7 @@ pip install "git+https://github.com/etchv-labs/python-sdk.git"
 
 ## Embed and detect
 
-Create an API key in [your Etchv dashboard](https://pilot.etchv.com/dashboard).
+Create an API key in [your Etchv account](https://etchv.com).
 Set `ETCHV_API_KEY` in your environment. The key needs `watermarks:embed` and
 `watermarks:detect` scopes and an active plan with available credits.
 
@@ -39,7 +39,7 @@ and `request_id`. Forensic data must be a non-empty JSON object; the service
 embeds its SHA-256 digest. Detection recovers the digest, not the original data.
 Input must be encoded image bytes (up to 20 MB); image validation happens server-side.
 
-Optional constructor arguments: `base_url` (default `https://pilot.api.etchv.com`),
+Optional constructor arguments: `base_url` (default `https://api.etchv.com`),
 `timeout` in seconds (default 120), and an HTTPX `transport` for tests.
 Both operations accept `filename` and `idempotency_key` keyword arguments.
 
