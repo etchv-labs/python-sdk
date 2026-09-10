@@ -54,4 +54,39 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(ValueError): sdk.embed_image(PNG, {'value':float('nan')})
             with self.assertRaises(ValueError): sdk.detect_image(b'')
 
+    def test_durable_retry_and_trusted_poll(self):
+        calls = []
+        job = 'req_' + ID
+        def handle(request):
+            calls.append(request)
+            if len(calls) == 1:
+                raise httpx.ReadError('lost response')
+            if len(calls) == 2:
+                return httpx.Response(202, json={'request_id':job, 'result_url':'https://evil.example/result'}, headers={'retry-after':'.01'})
+            self.assertEqual(request.method, 'GET')
+            self.assertEqual(str(request.url), f'https://api.etchv.com/watermarks/jobs/{job}/result')
+            return httpx.Response(200, content=PNG, headers={'content-type':'image/png','x-watermark-id':ID,'x-request-id':job})
+        with Etchv('test-key', transport=httpx.MockTransport(handle)) as sdk:
+            self.assertEqual(sdk.embed_image(PNG, {'asset':'a'}).request_id, job)
+            self.assertEqual(calls[0].headers['idempotency-key'], calls[1].headers['idempotency-key'])
+            self.assertEqual(sdk.get_embed_result(job).image, PNG)
+
+    def test_terminal_failure_and_deadline(self):
+        calls = []
+        def handle(request):
+            calls.append(request)
+            return httpx.Response(503, json={'status':'failed'})
+        with Etchv('test-key', transport=httpx.MockTransport(handle)) as sdk:
+            with self.assertRaises(EtchvError) as caught:
+                sdk.embed_image(PNG, {'asset':'a'})
+            self.assertEqual(caught.exception.status_code, 503)
+            self.assertEqual(len(calls), 1)
+        job = 'req_' + ID
+        with Etchv('test-key', timeout=.025, transport=httpx.MockTransport(lambda r: httpx.Response(202,json={'request_id':job}))) as sdk:
+            with self.assertRaises(EtchvError) as caught:
+                sdk.embed_image(PNG, {'asset':'a'}, idempotency_key='recovery-key')
+            self.assertEqual(caught.exception.request_id, job)
+            self.assertEqual(caught.exception.detail['idempotency_key'], 'recovery-key')
+            self.assertEqual(caught.exception.status_code, 0)
+
 if __name__ == '__main__': unittest.main()
