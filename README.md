@@ -74,7 +74,15 @@ To resume a known embedding job, call `get_embed_result(request_id)`. Supply you
 idempotency key when embedding if you need recovery across process restarts.
 
 
-Version 0.2.0 supports original-format image results. Use the returned filename
+Version 0.3.0 supports native image, PDF and video results. Use the returned filename
 when saving bytes; older clients that require PNG must be upgraded. Detection's
 `units` field reports each frame, page or layered composite separately. The
 top-level identifier is only present when all units recover the same watermark.
+
+## PDF documents
+
+Use `embed_document` and `detect_document` for native PDFs. The existing `image` result field contains PDF bytes. Selectable text and vector content are retained; detection reports one unit per page. See [PDF limits and preservation](https://etchv.com/docs/api/documents).
+
+## Video
+
+Use `embed_video` / `detect_video` for the supported H.264 MP4/MOV profile. Both methods poll durable jobs. Each successful operation costs one credit per started minute; audio is preserved but not watermarked. The `image` result field contains native video bytes. See [video requirements](https://etchv.com/docs/api/videos).

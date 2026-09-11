@@ -78,13 +78,14 @@ class Etchv:
         headers = {}
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
-        durable = path == "watermarks/images"
+        durable = path in ("watermarks/images", "watermarks/documents", "watermarks/videos", "watermarks/videos/detect")
         if durable and not idempotency_key:
             headers["Idempotency-Key"] = uuid4().hex
         return self._request(path, "POST", durable, headers=headers,
                              files={"file": (filename, image, "application/octet-stream")}, data=data)
 
     def _request(self, path, method, durable, **kwargs):
+        detection_job = path == "watermarks/videos/detect" or "detection-jobs/" in path
         deadline = time.monotonic() + self._timeout
         match = re.search(r"watermarks/jobs/(req_[a-f0-9]{64})", path)
         request_id = match.group(1) if match else None
@@ -110,7 +111,7 @@ class Etchv:
                 if not isinstance(detail, dict) or not re.fullmatch(r"req_[a-f0-9]{64}", str(detail.get("request_id", ""))):
                     raise EtchvError(202, "Invalid job response", request_id)
                 request_id = detail["request_id"]
-                path, method, kwargs = f"watermarks/jobs/{request_id}/result", "GET", {}
+                path, method, kwargs = f"watermarks/{'detection-jobs' if detection_job else 'jobs'}/{request_id}/result", "GET", {}
                 try:
                     delay = float(response.headers.get("retry-after", "1"))
                     delay = min(5, max(.01, delay)) if math.isfinite(delay) else 1
@@ -131,10 +132,21 @@ class Etchv:
 
     def embed_image(self, image: bytes, data: dict[str, Any], *, filename: str = "image.png",
                     idempotency_key: str | None = None) -> EmbedResult:
+        return self._embed_media("images", image, data, filename, idempotency_key)
+
+    def embed_document(self, document: bytes, data: dict[str, Any], *, filename: str = "document.pdf",
+                       idempotency_key: str | None = None) -> EmbedResult:
+        return self._embed_media("documents", document, data, filename, idempotency_key)
+
+    def embed_video(self, video: bytes, data: dict[str, Any], *, filename: str = "video.mp4",
+                    idempotency_key: str | None = None) -> EmbedResult:
+        return self._embed_media("videos", video, data, filename, idempotency_key)
+
+    def _embed_media(self, media, image, data, filename, idempotency_key):
         if not isinstance(data, dict) or not data:
             raise ValueError("data must be a non-empty JSON object")
         encoded = json.dumps(data, allow_nan=False)
-        response = self._post("watermarks/images", image, filename, {"data": encoded}, idempotency_key)
+        response = self._post(f"watermarks/{media}", image, filename, {"data": encoded}, idempotency_key)
         return self._embedding_result(response)
 
     def _embedding_result(self, response: httpx.Response) -> EmbedResult:
@@ -149,7 +161,18 @@ class Etchv:
 
     def detect_image(self, image: bytes, *, filename: str = "image.png",
                      idempotency_key: str | None = None) -> DetectionResult:
-        response = self._post("watermarks/images/detect", image, filename, None, idempotency_key)
+        return self._detect_media("images", image, filename, idempotency_key)
+
+    def detect_document(self, document: bytes, *, filename: str = "document.pdf",
+                        idempotency_key: str | None = None) -> DetectionResult:
+        return self._detect_media("documents", document, filename, idempotency_key)
+
+    def detect_video(self, video: bytes, *, filename: str = "video.mp4",
+                     idempotency_key: str | None = None) -> DetectionResult:
+        return self._detect_media("videos", video, filename, idempotency_key)
+
+    def _detect_media(self, media, image, filename, idempotency_key):
+        response = self._post(f"watermarks/{media}/detect", image, filename, None, idempotency_key)
         try:
             result = response.json()
             confidence = result["confidence"]
@@ -183,6 +206,8 @@ def _valid_id(value: Any) -> bool:
 
 
 def _image_extension(data: bytes, mime: str) -> str | None:
+    if mime in ("video/mp4", "video/quicktime") and data[4:8] == b"ftyp": return "mp4" if mime == "video/mp4" else "mov"
+    if mime == "application/pdf" and data.startswith(b"%PDF-"): return "pdf"
     signatures = {
         "image/png": ((b"\x89PNG\r\n\x1a\n",), "png"),
         "image/jpeg": ((b"\xff\xd8\xff",), "jpg"),

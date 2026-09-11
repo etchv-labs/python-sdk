@@ -20,6 +20,29 @@ class ClientTests(unittest.TestCase):
             result = sdk.embed_image(PNG, {'recipient':'test'}, filename='photo.png', idempotency_key='unique-request')
             self.assertEqual((result.image, result.watermark_id, result.request_id), (PNG, ID, 'req_1'))
 
+    def test_document_routes_and_binary_result(self):
+        pdf = b"%PDF-1.7 fixture"
+        def handle(request):
+            self.assertEqual(request.url.path, "/watermarks/documents")
+            self.assertTrue(request.headers["idempotency-key"])
+            return httpx.Response(200, content=pdf, headers={"content-type":"application/pdf", "x-watermark-id":ID})
+        with Etchv("test-key", transport=httpx.MockTransport(handle)) as sdk:
+            result = sdk.embed_document(pdf, {"recipient":"test"})
+            self.assertEqual(result.image, pdf)
+            self.assertEqual(result.content_type, "application/pdf")
+
+    def test_video_detection_polls_scoped_result(self):
+        calls=[]
+        request_id="req_"+"c"*64
+        def handle(request):
+            calls.append(request.url.path)
+            if len(calls)==1:
+                return httpx.Response(202,json={"request_id":request_id},headers={"retry-after":"0.01"})
+            return httpx.Response(200,json={"watermarked":False,"confidence":.5,"watermark_id":None})
+        with Etchv("test-key",transport=httpx.MockTransport(handle)) as sdk:
+            self.assertFalse(sdk.detect_video(b"video").watermarked)
+        self.assertEqual(calls,["/watermarks/videos/detect",f"/watermarks/detection-jobs/{request_id}/result"])
+
     def test_detection(self):
         for marked in [True, False]:
             def handle(request):
