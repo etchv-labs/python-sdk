@@ -90,3 +90,24 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(caught.exception.status_code, 0)
 
 if __name__ == '__main__': unittest.main()
+
+class NativeImageTests(unittest.TestCase):
+    def test_native_images_and_mismatched_content_types(self):
+        fixtures = [
+            ('image/jpeg', 'jpg', b'\xff\xd8\xff'), ('image/gif', 'gif', b'GIF89a'),
+            ('image/tiff', 'tiff', b'II*\0'), ('image/bmp', 'bmp', b'BM'),
+            ('image/x-portable-pixmap', 'ppm', b'P6\n'), ('image/webp', 'webp', b'RIFF0000WEBP'),
+            ('image/vnd.adobe.photoshop', 'psd', b'8BPS\0\1'),
+            ('image/vnd.adobe.photoshop', 'psb', b'8BPS\0\2'),
+        ]
+        for mime, extension, image in fixtures:
+            with self.subTest(extension=extension):
+                def handle(request):
+                    return httpx.Response(200, content=image, headers={'content-type':mime, 'x-watermark-id':ID, 'content-disposition':f'attachment; filename="original.{extension}"'})
+                with Etchv('test', transport=httpx.MockTransport(handle)) as sdk:
+                    result = sdk.embed_image(PNG, {'asset':'test'})
+                    self.assertEqual(result.image, image)
+                    self.assertEqual(result.content_type, mime)
+                    self.assertEqual(result.filename, f'original.{extension}')
+                with Etchv('test', transport=httpx.MockTransport(lambda r: httpx.Response(200, content=PNG, headers={'content-type':mime,'x-watermark-id':ID}))) as sdk:
+                    with self.assertRaises(EtchvError): sdk.embed_image(PNG, {'asset':'test'})

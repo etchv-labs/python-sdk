@@ -25,6 +25,16 @@ class EmbedResult:
     image: bytes
     watermark_id: str
     request_id: str | None
+    content_type: str = "image/png"
+    filename: str = "image-watermarked.png"
+
+
+@dataclass(frozen=True)
+class DetectionUnit:
+    index: int
+    watermarked: bool
+    confidence: float
+    watermark_id: str | None
 
 
 @dataclass(frozen=True)
@@ -33,6 +43,7 @@ class DetectionResult:
     confidence: float
     watermark_id: str | None
     request_id: str | None
+    units: tuple[DetectionUnit, ...] = ()
 
 
 class Etchv:
@@ -128,10 +139,13 @@ class Etchv:
 
     def _embedding_result(self, response: httpx.Response) -> EmbedResult:
         watermark_id = response.headers.get("x-watermark-id", "")
-        if (response.headers.get("content-type", "").split(";")[0] != "image/png"
-                or not response.content.startswith(b"\x89PNG\r\n\x1a\n") or not _valid_id(watermark_id)):
+        content_type = response.headers.get("content-type", "").split(";")[0]
+        extension = _image_extension(response.content, content_type)
+        if not extension or not _valid_id(watermark_id):
             raise EtchvError(200, "Invalid embedding response", response.headers.get("x-request-id"))
-        return EmbedResult(response.content, watermark_id, response.headers.get("x-request-id"))
+        match = re.search(r'filename="([A-Za-z0-9._-]+)"', response.headers.get("content-disposition", ""))
+        filename = match.group(1) if match else f"image-watermarked.{extension}"
+        return EmbedResult(response.content, watermark_id, response.headers.get("x-request-id"), content_type, filename)
 
     def detect_image(self, image: bytes, *, filename: str = "image.png",
                      idempotency_key: str | None = None) -> DetectionResult:
@@ -148,8 +162,40 @@ class Etchv:
                 raise ValueError()
         except (ValueError, KeyError, TypeError):
             raise EtchvError(200, "Invalid detection response", response.headers.get("x-request-id")) from None
-        return DetectionResult(detected, confidence, identifier, response.headers.get("x-request-id"))
+        raw_units = result.get("units", [{"index": 0, **result}])
+        if not isinstance(raw_units, list) or not raw_units:
+            raise EtchvError(200, "Invalid detection units", response.headers.get("x-request-id"))
+        units = []
+        for index, unit in enumerate(raw_units):
+            if (not isinstance(unit, dict) or type(unit.get("index")) is not int or unit.get("index") != index
+                    or type(unit.get("watermarked")) is not bool
+                    or type(unit.get("confidence")) not in (int, float)
+                    or not 0 <= unit["confidence"] <= 1
+                    or (unit["watermarked"] and not _valid_id(unit.get("watermark_id")))
+                    or (not unit["watermarked"] and unit.get("watermark_id") is not None)):
+                raise EtchvError(200, "Invalid detection units", response.headers.get("x-request-id"))
+            units.append(DetectionUnit(index, unit["watermarked"], unit["confidence"], unit.get("watermark_id")))
+        return DetectionResult(detected, confidence, identifier, response.headers.get("x-request-id"), tuple(units))
 
 
 def _valid_id(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
+
+
+def _image_extension(data: bytes, mime: str) -> str | None:
+    signatures = {
+        "image/png": ((b"\x89PNG\r\n\x1a\n",), "png"),
+        "image/jpeg": ((b"\xff\xd8\xff",), "jpg"),
+        "image/gif": ((b"GIF87a", b"GIF89a"), "gif"),
+        "image/tiff": ((b"II*\0", b"MM\0*"), "tiff"),
+        "image/bmp": ((b"BM",), "bmp"),
+        "image/x-portable-pixmap": ((b"P6", b"P3"), "ppm"),
+    }
+    if mime == "image/webp" and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if mime == "image/vnd.adobe.photoshop" and data[:4] == b"8BPS":
+        return {b"\0\1": "psd", b"\0\2": "psb"}.get(data[4:6])
+    if mime in signatures:
+        prefixes, extension = signatures[mime]
+        if data.startswith(prefixes): return extension
+    return None
