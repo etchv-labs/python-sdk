@@ -27,6 +27,8 @@ class EmbedResult:
     request_id: str | None
     content_type: str = "image/png"
     filename: str = "image-watermarked.png"
+    asset_id: str | None = None
+    source_asset_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +103,7 @@ class Etchv:
                 pause()
                 continue
             request_id = response.headers.get("x-request-id") or request_id
-            if response.status_code == 200:
+            if response.status_code in (200, 204):
                 return response
             try:
                 detail = response.json()
@@ -124,6 +126,38 @@ class Etchv:
                 continue
             raise EtchvError(response.status_code, detail, request_id)
         raise EtchvError(0, {"message": "Client deadline exceeded; the job may still complete", "idempotency_key": idempotency_key}, request_id)
+
+    @staticmethod
+    def _asset_path(asset_id: str) -> str:
+        if not isinstance(asset_id, str) or not re.fullmatch(r"ast_[a-f0-9]{64}", asset_id):
+            raise ValueError("Invalid asset ID")
+        return f"assets/{asset_id}"
+
+    def list_assets(self, *, limit: int = 25, cursor: str | None = None,
+                    kind: str | None = None, media_type: str | None = None,
+                    watermark_id: str | None = None) -> dict[str, Any]:
+        params = {k: v for k, v in dict(limit=limit, cursor=cursor, kind=kind,
+                  media_type=media_type, watermark_id=watermark_id).items() if v is not None}
+        return self._request("assets", "GET", False, params=params).json()
+
+    def get_asset(self, asset_id: str) -> dict[str, Any]:
+        return self._request(self._asset_path(asset_id), "GET", False).json()
+
+    def update_asset(self, asset_id: str, *, version: int, **changes: Any) -> dict[str, Any]:
+        return self._request(self._asset_path(asset_id), "PATCH", False, json={**changes, "version": version}).json()
+
+    def delete_asset(self, asset_id: str) -> None:
+        self._request(self._asset_path(asset_id), "DELETE", False)
+
+    def delete_assets(self, asset_ids: list[str]) -> None:
+        if not 1 <= len(asset_ids) <= 50:
+            raise ValueError("Provide 1–50 asset IDs")
+        for identifier in asset_ids:
+            self._asset_path(identifier)
+        self._request("assets/bulk-delete", "POST", False, json={"asset_ids": asset_ids})
+
+    def download_asset(self, asset_id: str) -> bytes:
+        return self._request(self._asset_path(asset_id) + "/content", "GET", False).content
 
     def get_embed_result(self, request_id: str) -> EmbedResult:
         if not re.fullmatch(r"req_[a-f0-9]{64}", request_id):
@@ -157,7 +191,7 @@ class Etchv:
             raise EtchvError(200, "Invalid embedding response", response.headers.get("x-request-id"))
         match = re.search(r'filename="([A-Za-z0-9._-]+)"', response.headers.get("content-disposition", ""))
         filename = match.group(1) if match else f"image-watermarked.{extension}"
-        return EmbedResult(response.content, watermark_id, response.headers.get("x-request-id"), content_type, filename)
+        return EmbedResult(response.content, watermark_id, response.headers.get("x-request-id"), content_type, filename, response.headers.get("x-asset-id"), response.headers.get("x-source-asset-id"))
 
     def detect_image(self, image: bytes, *, filename: str = "image.png",
                      idempotency_key: str | None = None) -> DetectionResult:

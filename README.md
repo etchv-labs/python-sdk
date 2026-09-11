@@ -74,7 +74,7 @@ To resume a known embedding job, call `get_embed_result(request_id)`. Supply you
 idempotency key when embedding if you need recovery across process restarts.
 
 
-Version 0.3.0 supports native image, PDF and video results. Use the returned filename
+Version 0.4.0 supports native image, PDF and video results. Use the returned filename
 when saving bytes; older clients that require PNG must be upgraded. Detection's
 `units` field reports each frame, page or layered composite separately. The
 top-level identifier is only present when all units recover the same watermark.
@@ -86,3 +86,28 @@ Use `embed_document` and `detect_document` for native PDFs. The existing `image`
 ## Video
 
 Use `embed_video` / `detect_video` for the supported H.264 MP4/MOV profile. Both methods poll durable jobs. Each successful operation costs one credit per started minute; audio is preserved but not watermarked. The `image` result field contains native video bytes. See [video requirements](https://etchv.com/docs/api/videos).
+
+## Asset library
+
+New successful embeddings save original and verified output assets. Files remain
+downloadable for 30 days; records stay until deleted. Use `assets:read` for listing,
+inspection and downloads, `assets:write` for edits, and `assets:delete` with current
+owner/admin membership for deletion. Existing keys need replacement to add scopes.
+
+```python
+page = client.list_assets(kind="watermarked", limit=25)
+for item in page["items"]:
+    asset = client.get_asset(item["id"])
+    updated = client.update_asset(asset["id"], version=asset["version"],
+                                  metadata={"campaign": "spring"})
+    if updated["file_available"]:
+        content = client.download_asset(updated["id"])
+# Pass cursor=page["next_cursor"] with the same filters for the next page.
+```
+
+Edits require the current version; reload and reconcile on HTTP 409. Metadata is
+replaced, not merged, and does not change the embedded watermark. Asset operations
+consume no credits. Downloads require authentication and return the original file
+format. Single and bulk deletion methods are also available; batches contain at
+most 50 IDs and delete atomically. Deleting an output blocks its job result replay.
+See [the asset API](https://etchv.com/docs/api/assets) for the complete contract.
