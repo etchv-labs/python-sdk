@@ -1,7 +1,7 @@
 # Etchv Python SDK
 
 Official server-side Python client for Etchv forensic image watermarking.
-Requires Python 3.10+. MIT licensed.
+Requires Python 3.14.7. MIT licensed.
 
 ## Install
 
@@ -74,7 +74,7 @@ To resume a known embedding job, call `get_embed_result(request_id)`. Supply you
 idempotency key when embedding if you need recovery across process restarts.
 
 
-Version 0.5.0 supports native image, PDF and video results. Use the returned filename
+Version 0.6.0 supports native image, PDF and video results. Use the returned filename
 when saving bytes; older clients that require PNG must be upgraded. Detection's
 `units` field reports each frame, page or layered composite separately. The
 top-level identifier is only present when all units recover the same watermark.
