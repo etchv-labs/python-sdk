@@ -80,13 +80,14 @@ class Etchv:
         headers = {}
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
-        durable = path in ("watermarks/images", "watermarks/documents", "watermarks/videos", "watermarks/videos/detect")
+        durable = path.split("?")[0].endswith("/async") or path in ("watermarks/images", "watermarks/documents", "watermarks/videos", "watermarks/videos/detect")
         if durable and not idempotency_key:
             headers["Idempotency-Key"] = uuid4().hex
         return self._request(path, "POST", durable, headers=headers,
                              files={"file": (filename, image, "application/octet-stream")}, data=data)
 
     def _request(self, path, method, durable, **kwargs):
+        async_submission = path.split("?")[0].endswith("/async")
         detection_job = path == "watermarks/videos/detect" or "detection-jobs/" in path
         deadline = time.monotonic() + self._timeout
         match = re.search(r"watermarks/jobs/(req_[a-f0-9]{64})", path)
@@ -103,7 +104,7 @@ class Etchv:
                 pause()
                 continue
             request_id = response.headers.get("x-request-id") or request_id
-            if response.status_code in (200, 204):
+            if response.status_code in (200, 204) or (async_submission and response.status_code == 202):
                 return response
             try:
                 detail = response.json()
@@ -126,6 +127,30 @@ class Etchv:
                 continue
             raise EtchvError(response.status_code, detail, request_id)
         raise EtchvError(0, {"message": "Client deadline exceeded; the job may still complete", "idempotency_key": idempotency_key}, request_id)
+
+    @staticmethod
+    def _async_path(media: str, detect: bool, webhook_id: str | None) -> str:
+        if media not in ("images", "documents", "videos"):
+            raise ValueError("media must be images, documents or videos")
+        if webhook_id is not None and not re.fullmatch(r"wh_[a-f0-9]{32}", webhook_id):
+            raise ValueError("Invalid webhook ID")
+        return f"watermarks/{media}{'/detect' if detect else ''}/async" + (f"?webhook_id={webhook_id}" if webhook_id else "")
+
+    def submit_embed(self, media: str, file: bytes, data: dict[str, Any], *, filename: str = "file",
+                     idempotency_key: str | None = None, webhook_id: str | None = None) -> dict[str, Any]:
+        if not isinstance(data, dict) or not data:
+            raise ValueError("data must be a non-empty JSON object")
+        return self._post(self._async_path(media, False, webhook_id), file, filename,
+                          {"data": json.dumps(data, allow_nan=False)}, idempotency_key).json()
+
+    def submit_detection(self, media: str, file: bytes, *, filename: str = "file",
+                         idempotency_key: str | None = None, webhook_id: str | None = None) -> dict[str, Any]:
+        return self._post(self._async_path(media, True, webhook_id), file, filename, None, idempotency_key).json()
+
+    def get_job(self, request_id: str, *, detect: bool = False) -> dict[str, Any]:
+        if not re.fullmatch(r"req_[a-f0-9]{64}", request_id):
+            raise ValueError("Invalid request ID")
+        return self._request(f"watermarks/{'detection-jobs' if detect else 'jobs'}/{request_id}", "GET", False).json()
 
     @staticmethod
     def _asset_path(asset_id: str) -> str:

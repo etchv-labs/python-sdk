@@ -74,7 +74,7 @@ To resume a known embedding job, call `get_embed_result(request_id)`. Supply you
 idempotency key when embedding if you need recovery across process restarts.
 
 
-Version 0.4.0 supports native image, PDF and video results. Use the returned filename
+Version 0.5.0 supports native image, PDF and video results. Use the returned filename
 when saving bytes; older clients that require PNG must be upgraded. Detection's
 `units` field reports each frame, page or layered composite separately. The
 top-level identifier is only present when all units recover the same watermark.
@@ -111,3 +111,17 @@ consume no credits. Downloads require authentication and return the original fil
 format. Single and bulk deletion methods are also available; batches contain at
 most 50 IDs and delete atomically. Deleting an output blocks its job result replay.
 See [the asset API](https://etchv.com/docs/api/assets) for the complete contract.
+
+## Async jobs and webhooks
+
+Submit a background job and receive a JSON receipt without polling automatically. Choose `images`, `documents`, or `videos`; every currently supported native format uses the same submission method.
+
+```python
+job = client.submit_embed("documents", pdf_bytes, {"delivery": "delivery_001"},
+    filename="document.pdf", idempotency_key="delivery_001", webhook_id=webhook_id)
+status = client.get_job(job["request_id"])
+```
+
+Use the corresponding submission method for detection without forensic data. For detection status, set the status method’s `detect` argument to true. Existing embed/detect methods continue waiting for results.
+
+Create an endpoint in the [Etchv dashboard](https://etchv.com/dashboard/webhooks), then pass its ID when submitting. Persist your idempotency key before the upload so a lost receipt can be recovered safely. Download from the authenticated result URL after success, or use the existing result method. See the [async guide](https://etchv.com/docs/api/async) and [webhook verification guide](https://etchv.com/docs/api/webhooks).
