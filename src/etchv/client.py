@@ -7,7 +7,7 @@ import math
 import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlencode
 
 import httpx
 
@@ -29,6 +29,7 @@ class EmbedResult:
     filename: str = "image-watermarked.png"
     asset_id: str | None = None
     source_asset_id: str | None = None
+    storage_delivery_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,7 @@ class Etchv:
         headers = {}
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
-        durable = path.split("?")[0].endswith("/async") or path in ("watermarks/images", "watermarks/documents", "watermarks/videos", "watermarks/videos/detect")
+        durable = path.split("?")[0].endswith("/async") or path.split("?")[0] in ("watermarks/images", "watermarks/documents", "watermarks/videos", "watermarks/videos/detect")
         if durable and not idempotency_key:
             headers["Idempotency-Key"] = uuid4().hex
         return self._request(path, "POST", durable, headers=headers,
@@ -137,10 +138,10 @@ class Etchv:
         return f"watermarks/{media}{'/detect' if detect else ''}/async" + (f"?webhook_id={webhook_id}" if webhook_id else "")
 
     def submit_embed(self, media: str, file: bytes, data: dict[str, Any], *, filename: str = "file",
-                     idempotency_key: str | None = None, webhook_id: str | None = None) -> dict[str, Any]:
+                     idempotency_key: str | None = None, webhook_id: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None) -> dict[str, Any]:
         if not isinstance(data, dict) or not data:
             raise ValueError("data must be a non-empty JSON object")
-        return self._post(self._async_path(media, False, webhook_id), file, filename,
+        return self._post(self._storage_path(self._async_path(media, False, webhook_id), storage_destination_id, storage_key), file, filename,
                           {"data": json.dumps(data, allow_nan=False)}, idempotency_key).json()
 
     def submit_detection(self, media: str, file: bytes, *, filename: str = "file",
@@ -184,28 +185,41 @@ class Etchv:
     def download_asset(self, asset_id: str) -> bytes:
         return self._request(self._asset_path(asset_id) + "/content", "GET", False).content
 
+    @staticmethod
+    def _storage_path(path, destination, key):
+        if key is not None and destination is None: raise ValueError("storage_key requires storage_destination_id")
+        if destination is None: return path
+        if not re.fullmatch(r"dst_[a-f0-9]{32}", destination): raise ValueError("Invalid storage destination ID")
+        values = {"storage_destination_id": destination}
+        if key is not None: values["storage_key"] = key
+        return path + ("&" if "?" in path else "?") + urlencode(values)
+
+    def get_storage_delivery(self, identifier: str) -> dict[str, Any]:
+        if not re.fullmatch(r"std_[a-f0-9]{64}", identifier): raise ValueError("Invalid storage delivery ID")
+        return self._request(f"storage/deliveries/{identifier}", "GET", False).json()
+
     def get_embed_result(self, request_id: str) -> EmbedResult:
         if not re.fullmatch(r"req_[a-f0-9]{64}", request_id):
             raise ValueError("Invalid request ID")
         return self._embedding_result(self._request(f"watermarks/jobs/{request_id}/result", "GET", True))
 
     def embed_image(self, image: bytes, data: dict[str, Any], *, filename: str = "image.png",
-                    idempotency_key: str | None = None) -> EmbedResult:
-        return self._embed_media("images", image, data, filename, idempotency_key)
+                    idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None) -> EmbedResult:
+        return self._embed_media("images", image, data, filename, idempotency_key, storage_destination_id, storage_key)
 
     def embed_document(self, document: bytes, data: dict[str, Any], *, filename: str = "document.pdf",
-                       idempotency_key: str | None = None) -> EmbedResult:
-        return self._embed_media("documents", document, data, filename, idempotency_key)
+                       idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None) -> EmbedResult:
+        return self._embed_media("documents", document, data, filename, idempotency_key, storage_destination_id, storage_key)
 
     def embed_video(self, video: bytes, data: dict[str, Any], *, filename: str = "video.mp4",
-                    idempotency_key: str | None = None) -> EmbedResult:
-        return self._embed_media("videos", video, data, filename, idempotency_key)
+                    idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None) -> EmbedResult:
+        return self._embed_media("videos", video, data, filename, idempotency_key, storage_destination_id, storage_key)
 
-    def _embed_media(self, media, image, data, filename, idempotency_key):
+    def _embed_media(self, media, image, data, filename, idempotency_key, destination, storage_key):
         if not isinstance(data, dict) or not data:
             raise ValueError("data must be a non-empty JSON object")
         encoded = json.dumps(data, allow_nan=False)
-        response = self._post(f"watermarks/{media}", image, filename, {"data": encoded}, idempotency_key)
+        response = self._post(self._storage_path(f"watermarks/{media}", destination, storage_key), image, filename, {"data": encoded}, idempotency_key)
         return self._embedding_result(response)
 
     def _embedding_result(self, response: httpx.Response) -> EmbedResult:
@@ -216,7 +230,7 @@ class Etchv:
             raise EtchvError(200, "Invalid embedding response", response.headers.get("x-request-id"))
         match = re.search(r'filename="([A-Za-z0-9._-]+)"', response.headers.get("content-disposition", ""))
         filename = match.group(1) if match else f"image-watermarked.{extension}"
-        return EmbedResult(response.content, watermark_id, response.headers.get("x-request-id"), content_type, filename, response.headers.get("x-asset-id"), response.headers.get("x-source-asset-id"))
+        return EmbedResult(response.content, watermark_id, response.headers.get("x-request-id"), content_type, filename, response.headers.get("x-asset-id"), response.headers.get("x-source-asset-id"), response.headers.get("x-storage-delivery-id"))
 
     def detect_image(self, image: bytes, *, filename: str = "image.png",
                      idempotency_key: str | None = None) -> DetectionResult:

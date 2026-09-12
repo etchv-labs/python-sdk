@@ -9,6 +9,9 @@ class AsyncTests(unittest.TestCase):
         webhook = 'wh_' + 'a' * 32
         def handle(request):
             calls.append(request.url.path)
+            if '/detect/' not in request.url.path:
+                assert request.url.params['storage_destination_id'] == 'dst_' + 'c' * 32
+                assert request.url.params['storage_key'] == 'a b/#file.pdf'
             assert request.method == 'POST'
             assert request.url.params['webhook_id'] == webhook
             assert request.headers['Idempotency-Key'] == 'stable_test_key'
@@ -17,7 +20,7 @@ class AsyncTests(unittest.TestCase):
         with Etchv('test-key', transport=httpx.MockTransport(handle)) as client:
             for media in ('images', 'documents', 'videos'):
                 options = dict(webhook_id=webhook, idempotency_key='stable_test_key')
-                assert client.submit_embed(media, b'file-bytes', {'asset': 'test'}, **options)['status'] == 'queued'
+                assert client.submit_embed(media, b'file-bytes', {'asset': 'test'}, storage_destination_id='dst_' + 'c' * 32, storage_key='a b/#file.pdf', **options)['status'] == 'queued'
                 assert client.submit_detection(media, b'file-bytes', **options)['status'] == 'queued'
         assert len(calls) == 6
         assert all(path.endswith('/async') for path in calls)

@@ -74,7 +74,7 @@ To resume a known embedding job, call `get_embed_result(request_id)`. Supply you
 idempotency key when embedding if you need recovery across process restarts.
 
 
-Version 0.6.0 supports native image, PDF and video results. Use the returned filename
+Version 0.7.0 supports native image, PDF and video results. Use the returned filename
 when saving bytes; older clients that require PNG must be upgraded. Detection's
 `units` field reports each frame, page or layered composite separately. The
 top-level identifier is only present when all units recover the same watermark.
@@ -125,3 +125,27 @@ status = client.get_job(job["request_id"])
 Use the corresponding submission method for detection without forensic data. For detection status, set the status method’s `detect` argument to true. Existing embed/detect methods continue waiting for results.
 
 Create an endpoint in the [Etchv dashboard](https://etchv.com/dashboard/webhooks), then pass its ID when submitting. Persist your idempotency key before the upload so a lost receipt can be recovered safely. Download from the authenticated result URL after success, or use the existing result method. See the [async guide](https://etchv.com/docs/api/async) and [webhook verification guide](https://etchv.com/docs/api/webhooks).
+
+## Customer-owned storage
+
+Version 0.7.0 adds storage destination and object-key options to image,
+PDF and video embedding, including asynchronous submission. Configure and verify
+a destination first in the dashboard.
+
+```python
+job = client.submit_embed("documents", pdf_bytes, {"recipient": "customer-123"},
+    filename="report.pdf", storage_destination_id=destination_id,
+    storage_key="reports/watermarked.pdf", idempotency_key="report-export-001")
+# After watermark completion, the upload continues independently.
+# After the watermark job reports succeeded:
+delivery = client.get_storage_delivery(job["storage_delivery_id"])
+```
+
+The upload is queued after watermark verification, so its delivery record can
+initially return 404 while the watermark job is still processing. Wait for the
+watermark job to succeed before polling storage. Poll until `status` is `stored`,
+or handle a terminal failure. Upload retries do not watermark again or charge
+another credit. Binary embedding results include a storage delivery ID too.
+
+Use `storage:read` to inspect deliveries. Storage options do not apply to detection.
+See the [storage setup, retention and retry guide](https://etchv.com/docs/storage).
