@@ -7,7 +7,7 @@ name = "etchv-sdk"
 version = "0.6.0"
 description = "Python client for Etchv image watermarking"
 readme = "README.md"
-requires-python = ">=3.14.7,<3.15"
+requires-python = ">=3.14,<3.15"
 license = "MIT"
 authors = [{name = "Etchv", email = "hello@etchv.com"}]
 dependencies = ["httpx>=0.27,<1"]

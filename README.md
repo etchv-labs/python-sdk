@@ -1,7 +1,7 @@
 # Etchv Python SDK
 
 Official server-side Python client for Etchv forensic image watermarking.
-Requires Python 3.14.7. MIT licensed.
+Requires Python 3.14; development and CI use Python 3.14.7. MIT licensed.
 
 ## Install
 
