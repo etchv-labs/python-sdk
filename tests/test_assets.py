@@ -26,7 +26,9 @@ class AssetsTests(unittest.TestCase):
         with Etchv('test-key',transport=httpx.MockTransport(respond)) as client:
             assert client.list_assets(kind='watermarked')['next_cursor']=='next-page'
             assert calls[0].url.params['kind']=='watermarked'
-            assert client.get_asset(RECORD['id'])['metadata']['campaign']=='launch'
+            asset = client.get_asset(RECORD['id'])
+            assert asset['metadata']['campaign']=='launch'
+            assert asset['file_expires_at'] is None and asset['storage_provider']=='s3'
             assert client.update_asset(RECORD['id'],version=1,name='renamed')['version']==2
             assert client.download_asset(RECORD['id'])==b'file'
             client.delete_asset(RECORD['id']);client.delete_assets([RECORD['id']])
