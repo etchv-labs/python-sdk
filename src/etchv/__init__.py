@@ -1,0 +1,38 @@
+"""Official Python client for the Etchv forensic watermarking API."""
+from .client import (
+    __version__,
+    AuthenticationError,
+    ConflictError,
+    DeadlineExceededError,
+    DetectionResult,
+    DetectionUnit,
+    EmbedResult,
+    Etchv,
+    EtchvError,
+    GoneError,
+    NotFoundError,
+    PaymentRequiredError,
+    PermissionDeniedError,
+    RateLimitError,
+    WebhookVerificationError,
+    verify_webhook,
+)
+
+__all__ = [
+    "__version__",
+    "Etchv",
+    "EtchvError",
+    "AuthenticationError",
+    "PaymentRequiredError",
+    "PermissionDeniedError",
+    "NotFoundError",
+    "ConflictError",
+    "GoneError",
+    "RateLimitError",
+    "DeadlineExceededError",
+    "EmbedResult",
+    "DetectionResult",
+    "DetectionUnit",
+    "WebhookVerificationError",
+    "verify_webhook",
+]
