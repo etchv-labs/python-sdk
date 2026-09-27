@@ -192,8 +192,8 @@ class Etchv:
 
     def _post(self, path: str, image: bytes, filename: str,
               data: dict[str, str] | None, idempotency_key: str | None) -> httpx.Response:
-        if not isinstance(image, bytes) or not image or len(image) > 20 * 1024 * 1024:
-            raise ValueError("image must contain 1 byte to 20 MB of encoded image bytes")
+        if not isinstance(image, bytes) or not image or len(image) > 50 * 1024 * 1024:
+            raise ValueError("image must contain 1 byte to 50 MB of encoded image bytes")
         headers = {}
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key

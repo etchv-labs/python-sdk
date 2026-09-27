@@ -32,8 +32,9 @@ with Etchv(os.environ["ETCHV_API_KEY"]) as client:
 ```
 
 Use `embed_document` / `detect_document` for PDFs and `embed_video` /
-`detect_video` for H.264 MP4/MOV. Uploads are limited to 20 MB. Detection
-recovers a SHA-256 digest of your data, not the data itself.
+`detect_video` for H.264 MP4/MOV. Image uploads are limited to 50 MB; PDF and
+video uploads to 20 MB. Detection recovers a SHA-256 digest of your data, not
+the data itself.
 
 ## Async jobs
 
