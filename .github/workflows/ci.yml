@@ -9,7 +9,6 @@ jobs:
       matrix:
         python: ['3.14.7']
     steps:
-      - uses: $/.github/actions/node26
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
         with:
