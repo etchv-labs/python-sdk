@@ -1,6 +1,7 @@
 """Official Python client for the Etchv forensic watermarking API."""
 from .client import (
     __version__,
+    Accelerator,
     AuthenticationError,
     ConflictError,
     DeadlineExceededError,
@@ -21,6 +22,7 @@ from .client import (
 __all__ = [
     "__version__",
     "Etchv",
+    "Accelerator",
     "EtchvError",
     "AuthenticationError",
     "PaymentRequiredError",

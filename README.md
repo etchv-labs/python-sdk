@@ -36,6 +36,20 @@ Use `embed_document` / `detect_document` for PDFs and `embed_video` /
 video uploads to 20 MB. Detection recovers a SHA-256 digest of your data, not
 the data itself.
 
+## GPU processing
+
+Business and Enterprise plans can pass `accelerator="gpu"` to any embed,
+detect or submit method (other plans get `PermissionDeniedError`). GPU
+operations use 3× credits. If no GPU is ready, the job runs on CPU at normal
+credits instead. `result.accelerator` reports the hardware actually used
+(`"gpu"` or `"cpu"`), and job receipts include `accelerator_requested` and
+`accelerator`.
+
+```python
+result = client.embed_video(video_bytes, {"recipient": "customer-123"}, accelerator="gpu")
+print(result.accelerator)  # "gpu", or "cpu" after a fallback
+```
+
 ## Async jobs
 
 ```python
@@ -69,7 +83,12 @@ result (kept 24 hours) without another charge.
 API failures raise `EtchvError` or a subclass such as `AuthenticationError`,
 `PermissionDeniedError`, `ConflictError`, `GoneError`, `RateLimitError` or
 `DeadlineExceededError`. Each carries `status_code`, `detail` and `request_id`
-(quote it to support). Messages never include your API key.
+(quote it to support). Messages never include your API key. Structured API
+errors also set `code` (for example `rate_limited` or `concurrency_limited`),
+`message` (also shown in the error text) and `limit`, and `retry_after` holds
+the `Retry-After` seconds (`None` when not sent).
+Embedding, video detection and job calls retry HTTP 429, 502, 503 and 504
+within `timeout`, waiting for `Retry-After` (up to 5 seconds per wait) on 429.
 
 ```python
 from etchv import EtchvError

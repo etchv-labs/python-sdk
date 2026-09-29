@@ -9,13 +9,17 @@ from uuid import uuid4
 import math
 import re
 from dataclasses import dataclass
-from typing import Any
+from email.utils import parsedate_to_datetime
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlencode
 
 import httpx
 
 __version__ = "1.0.0"
 USER_AGENT = f"etchv-python/{__version__}"
+
+Accelerator = Literal["cpu", "gpu"]
+"""Processing hardware for embedding and detection: ``"cpu"`` (default) or ``"gpu"``."""
 
 
 class EtchvError(RuntimeError):
@@ -24,17 +28,34 @@ class EtchvError(RuntimeError):
     ``status_code`` is the HTTP status (``0`` when the client deadline passed
     before a durable job finished), ``detail`` is the parsed error body and
     ``request_id`` is the ``X-Request-ID`` (or job ID) to quote to support.
-    The message never contains the API key or the response body.
+    When the API returns a structured error, ``code`` (for example
+    ``"rate_limited"``), ``message`` and ``limit`` are its machine-readable
+    code, explanation and the limit that applied (``message`` is also set for a
+    plain-text ``detail``); otherwise they are ``None``. A structured
+    ``message`` is included in the exception text. ``retry_after`` is the
+    ``Retry-After`` delay in seconds, or ``None`` when the response sent none.
+    The exception text never contains the API key or the raw response body.
     """
 
-    def __init__(self, status_code: int, detail: Any, request_id: str | None = None):
-        message = f"Etchv request failed (HTTP {status_code})"
+    def __init__(self, status_code: int, detail: Any, request_id: str | None = None, *,
+                 retry_after: float | None = None):
+        inner = detail.get("detail") if isinstance(detail, dict) else None
+        structured = inner if isinstance(inner, dict) else {}
+        message = structured.get("message") if structured else inner
+        self.message: str | None = message if isinstance(message, str) else None
+        self.code: str | None = structured.get("code") if isinstance(structured.get("code"), str) else None
+        limit = structured.get("limit")
+        self.limit: int | None = limit if type(limit) is int else None
+        text = f"Etchv request failed (HTTP {status_code})"
+        if structured and self.message:
+            text += f": {self.message}"
         if request_id:
-            message += f"; request ID {request_id}"
-        super().__init__(message)
+            text += f"; request ID {request_id}"
+        super().__init__(text)
         self.status_code = status_code
         self.detail = detail
         self.request_id = request_id
+        self.retry_after = retry_after
 
 
 class AuthenticationError(EtchvError):
@@ -65,7 +86,8 @@ class GoneError(EtchvError):
 
 
 class RateLimitError(EtchvError):
-    """HTTP 429: too many requests."""
+    """HTTP 429: too many requests (``code`` ``"rate_limited"``) or too many
+    concurrent jobs (``"concurrency_limited"``). Wait ``retry_after`` seconds."""
 
 
 class DeadlineExceededError(EtchvError):
@@ -82,8 +104,8 @@ _ERRORS: dict[int, type[EtchvError]] = {
 }
 
 
-def _error(status_code: int, detail: Any, request_id: str | None) -> EtchvError:
-    return _ERRORS.get(status_code, EtchvError)(status_code, detail, request_id)
+def _error(status_code: int, detail: Any, request_id: str | None, retry_after: float | None = None) -> EtchvError:
+    return _ERRORS.get(status_code, EtchvError)(status_code, detail, request_id, retry_after=retry_after)
 
 
 class WebhookVerificationError(ValueError):
@@ -137,6 +159,8 @@ class EmbedResult:
     asset_id: str | None = None
     source_asset_id: str | None = None
     storage_delivery_id: str | None = None
+    accelerator: Accelerator | None = None
+    """Hardware that processed the file (``"cpu"`` or ``"gpu"``), when reported."""
 
 
 @dataclass(frozen=True)
@@ -156,6 +180,8 @@ class DetectionResult:
     watermark_id: str | None
     request_id: str | None
     units: tuple[DetectionUnit, ...] = ()
+    accelerator: Accelerator | None = None
+    """Hardware that ran detection (``"cpu"`` or ``"gpu"``), when reported."""
 
 
 class Etchv:
@@ -206,7 +232,7 @@ class Etchv:
     def _request(self, path: str, method: str, durable: bool, *, accept: tuple[int, ...] = (),
                  **kwargs: Any) -> httpx.Response:
         async_submission = path.split("?")[0].endswith("/async")
-        detection_job = path == "watermarks/videos/detect" or "detection-jobs/" in path
+        detection_job = path.split("?")[0] == "watermarks/videos/detect" or "detection-jobs/" in path
         deadline = time.monotonic() + self._timeout
         match = re.search(r"watermarks/(?:detection-)?jobs/(req_[a-f0-9]{64})", path)
         request_id = match.group(1) if match else None
@@ -242,9 +268,10 @@ class Etchv:
                 pause(delay)
                 continue
             if durable and response.status_code in (429, 502, 503, 504) and not (isinstance(detail, dict) and detail.get("status") == "failed"):
-                pause()
+                delay = _retry_after(response.headers.get("retry-after")) if response.status_code == 429 else None
+                pause(1 if delay is None else min(5, max(.01, delay)))
                 continue
-            raise _error(response.status_code, detail, request_id)
+            raise _error(response.status_code, detail, request_id, _retry_after(response.headers.get("retry-after")))
         raise DeadlineExceededError(0, {"message": "Client deadline exceeded; the job may still complete", "idempotency_key": idempotency_key, "request_id": request_id}, request_id)
 
     def _json(self, path: str, method: str = "GET", *, accept: tuple[int, ...] = (), **kwargs: Any) -> Any:
@@ -274,25 +301,42 @@ class Etchv:
             _check_id(webhook_id, r"wh_[a-f0-9]{32}", "webhook ID")
         return f"watermarks/{media}{'/detect' if detect else ''}/async" + (f"?webhook_id={webhook_id}" if webhook_id else "")
 
+    @staticmethod
+    def _accelerator_path(path: str, accelerator: Accelerator | None) -> str:
+        if accelerator is None:
+            return path
+        if accelerator not in ("cpu", "gpu"):
+            raise ValueError('accelerator must be "cpu" or "gpu"')
+        return path + ("&" if "?" in path else "?") + f"accelerator={accelerator}"
+
     def submit_embed(self, media: str, file: bytes, data: dict[str, Any], *, filename: str = "file",
-                     idempotency_key: str | None = None, webhook_id: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None) -> dict[str, Any]:
+                     idempotency_key: str | None = None, webhook_id: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None,
+                     accelerator: Accelerator | None = None) -> dict[str, Any]:
         """Submit a background embedding job and return its 202 JSON receipt without polling.
 
         ``media`` is ``"images"``, ``"documents"`` or ``"videos"``. Transient
         failures are retried with the same idempotency key (generated when omitted).
+        ``accelerator="gpu"`` requests GPU processing (see ``embed_image``).
         """
         if not isinstance(data, dict) or not data:
             raise ValueError("data must be a non-empty JSON object")
-        return self._post(self._storage_path(self._async_path(media, False, webhook_id), storage_destination_id, storage_key), file, filename,
+        path = self._storage_path(self._async_path(media, False, webhook_id), storage_destination_id, storage_key)
+        return self._post(self._accelerator_path(path, accelerator), file, filename,
                           {"data": json.dumps(data, allow_nan=False)}, idempotency_key).json()
 
     def submit_detection(self, media: str, file: bytes, *, filename: str = "file",
-                         idempotency_key: str | None = None, webhook_id: str | None = None) -> dict[str, Any]:
+                         idempotency_key: str | None = None, webhook_id: str | None = None,
+                         accelerator: Accelerator | None = None) -> dict[str, Any]:
         """Submit a background detection job and return its 202 JSON receipt without polling."""
-        return self._post(self._async_path(media, True, webhook_id), file, filename, None, idempotency_key).json()
+        path = self._accelerator_path(self._async_path(media, True, webhook_id), accelerator)
+        return self._post(path, file, filename, None, idempotency_key).json()
 
     def get_job(self, request_id: str, *, detect: bool = False) -> dict[str, Any]:
-        """Read a job receipt. Set ``detect=True`` for detection jobs."""
+        """Read a job receipt. Set ``detect=True`` for detection jobs.
+
+        ``accelerator_requested`` and ``accelerator`` report the requested and
+        actual processing hardware.
+        """
         _check_id(request_id, r"req_[a-f0-9]{64}", "request ID")
         return self._json(f"watermarks/{'detection-jobs' if detect else 'jobs'}/{request_id}")
 
@@ -474,30 +518,38 @@ class Etchv:
     # Synchronous watermarking
 
     def embed_image(self, image: bytes, data: dict[str, Any], *, filename: str = "image.png",
-                    idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None) -> EmbedResult:
+                    idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None,
+                    accelerator: Accelerator | None = None) -> EmbedResult:
         """Watermark an image and wait for the verified file in its original format.
 
         Retries transient failures with the same idempotency key and polls
         pending jobs until ``timeout``; raises ``DeadlineExceededError`` then.
+        ``accelerator="gpu"`` (Business and Enterprise plans) uses 3x credits
+        and runs on CPU at normal credits when no GPU is ready; the result's
+        ``accelerator`` reports the hardware used.
         """
-        return self._embed_media("images", image, data, filename, idempotency_key, storage_destination_id, storage_key)
+        return self._embed_media("images", image, data, filename, idempotency_key, storage_destination_id, storage_key, accelerator)
 
     def embed_document(self, document: bytes, data: dict[str, Any], *, filename: str = "document.pdf",
-                       idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None) -> EmbedResult:
+                       idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None,
+                       accelerator: Accelerator | None = None) -> EmbedResult:
         """Watermark a PDF and wait for the verified PDF (see ``embed_image``)."""
-        return self._embed_media("documents", document, data, filename, idempotency_key, storage_destination_id, storage_key)
+        return self._embed_media("documents", document, data, filename, idempotency_key, storage_destination_id, storage_key, accelerator)
 
     def embed_video(self, video: bytes, data: dict[str, Any], *, filename: str = "video.mp4",
-                    idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None) -> EmbedResult:
+                    idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None,
+                    accelerator: Accelerator | None = None) -> EmbedResult:
         """Watermark an MP4/MOV video and wait for the verified video (see ``embed_image``)."""
-        return self._embed_media("videos", video, data, filename, idempotency_key, storage_destination_id, storage_key)
+        return self._embed_media("videos", video, data, filename, idempotency_key, storage_destination_id, storage_key, accelerator)
 
     def _embed_media(self, media: str, image: bytes, data: dict[str, Any], filename: str,
-                     idempotency_key: str | None, destination: str | None, storage_key: str | None) -> EmbedResult:
+                     idempotency_key: str | None, destination: str | None, storage_key: str | None,
+                     accelerator: Accelerator | None) -> EmbedResult:
         if not isinstance(data, dict) or not data:
             raise ValueError("data must be a non-empty JSON object")
         encoded = json.dumps(data, allow_nan=False)
-        response = self._post(self._storage_path(f"watermarks/{media}", destination, storage_key), image, filename, {"data": encoded}, idempotency_key)
+        path = self._accelerator_path(self._storage_path(f"watermarks/{media}", destination, storage_key), accelerator)
+        response = self._post(path, image, filename, {"data": encoded}, idempotency_key)
         return self._embedding_result(response)
 
     def _embedding_result(self, response: httpx.Response) -> EmbedResult:
@@ -508,27 +560,33 @@ class Etchv:
             raise EtchvError(200, "Invalid embedding response", response.headers.get("x-request-id"))
         match = re.search(r'filename="([A-Za-z0-9._-]+)"', response.headers.get("content-disposition", ""))
         filename = match.group(1) if match else f"image-watermarked.{extension}"
-        return EmbedResult(response.content, watermark_id, response.headers.get("x-request-id"), content_type, filename, response.headers.get("x-asset-id"), response.headers.get("x-source-asset-id"), response.headers.get("x-storage-delivery-id"))
+        return EmbedResult(response.content, watermark_id, response.headers.get("x-request-id"), content_type, filename, response.headers.get("x-asset-id"), response.headers.get("x-source-asset-id"), response.headers.get("x-storage-delivery-id"),
+                           _accelerator(response.headers.get("x-etchv-accelerator")))
 
     # Synchronous detection
 
     def detect_image(self, image: bytes, *, filename: str = "image.png",
-                     idempotency_key: str | None = None) -> DetectionResult:
-        """Detect a watermark in an image. Not retried automatically."""
-        return self._detect_media("images", image, filename, idempotency_key)
+                     idempotency_key: str | None = None, accelerator: Accelerator | None = None) -> DetectionResult:
+        """Detect a watermark in an image. Not retried automatically.
+
+        ``accelerator="gpu"`` requests GPU processing (see ``embed_image``).
+        """
+        return self._detect_media("images", image, filename, idempotency_key, accelerator)
 
     def detect_document(self, document: bytes, *, filename: str = "document.pdf",
-                        idempotency_key: str | None = None) -> DetectionResult:
+                        idempotency_key: str | None = None, accelerator: Accelerator | None = None) -> DetectionResult:
         """Detect watermarks page by page in a PDF. Not retried automatically."""
-        return self._detect_media("documents", document, filename, idempotency_key)
+        return self._detect_media("documents", document, filename, idempotency_key, accelerator)
 
     def detect_video(self, video: bytes, *, filename: str = "video.mp4",
-                     idempotency_key: str | None = None) -> DetectionResult:
+                     idempotency_key: str | None = None, accelerator: Accelerator | None = None) -> DetectionResult:
         """Detect watermarks frame by frame in a video, polling the durable job."""
-        return self._detect_media("videos", video, filename, idempotency_key)
+        return self._detect_media("videos", video, filename, idempotency_key, accelerator)
 
-    def _detect_media(self, media: str, image: bytes, filename: str, idempotency_key: str | None) -> DetectionResult:
-        return self._detection_result(self._post(f"watermarks/{media}/detect", image, filename, None, idempotency_key))
+    def _detect_media(self, media: str, image: bytes, filename: str, idempotency_key: str | None,
+                      accelerator: Accelerator | None) -> DetectionResult:
+        path = self._accelerator_path(f"watermarks/{media}/detect", accelerator)
+        return self._detection_result(self._post(path, image, filename, None, idempotency_key))
 
     def _detection_result(self, response: httpx.Response) -> DetectionResult:
         try:
@@ -556,12 +614,31 @@ class Etchv:
                     or (not unit["watermarked"] and unit.get("watermark_id") is not None)):
                 raise EtchvError(200, "Invalid detection units", response.headers.get("x-request-id"))
             units.append(DetectionUnit(index, unit["watermarked"], unit["confidence"], unit.get("watermark_id")))
-        return DetectionResult(detected, confidence, identifier, response.headers.get("x-request-id"), tuple(units))
+        accelerator = _accelerator(response.headers.get("x-etchv-accelerator")) or _accelerator(result.get("accelerator"))
+        return DetectionResult(detected, confidence, identifier, response.headers.get("x-request-id"), tuple(units), accelerator)
 
 
 def _check_id(value: Any, pattern: str, label: str) -> None:
     if not isinstance(value, str) or not re.fullmatch(pattern, value):
         raise ValueError(f"Invalid {label}")
+
+
+def _accelerator(value: Any) -> Accelerator | None:
+    return value if value in ("cpu", "gpu") else None
+
+
+def _retry_after(value: str | None) -> float | None:
+    """Seconds from a ``Retry-After`` header (delta-seconds or HTTP date), or ``None``."""
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(value).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, seconds) if math.isfinite(seconds) else None
 
 
 def _valid_id(value: Any) -> bool:
