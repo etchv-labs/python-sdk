@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
+import os
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from uuid import uuid4
 import math
 import re
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal, TypedDict
 from urllib.parse import urlsplit, urlencode
 
 import httpx
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 USER_AGENT = f"etchv-python/{__version__}"
 
 Accelerator = Literal["cpu", "gpu"]
@@ -96,6 +100,29 @@ class DeadlineExceededError(EtchvError):
     The job may still complete. ``detail`` contains the ``idempotency_key``
     and ``request_id`` (when known) for recovery.
     """
+
+
+class BatchSubmitError(EtchvError):
+    """``submit_batch`` failed after the batch was created: an upload (or the
+    start) could not complete.
+
+    ``batch_id`` and ``idempotency_key`` are always set. Call ``submit_batch``
+    again with that ``idempotency_key`` and the same items: files that already
+    arrived are skipped, the rest are uploaded and the batch starts.
+    ``status_code`` is the HTTP status of the failure, or 0 for a network error,
+    timeout or unreadable file (see ``__cause__``). ``index`` and ``filename``
+    name the file when one failed.
+    """
+
+    def __init__(self, status_code: int, detail: Any, request_id: str | None = None, *,
+                 retry_after: float | None = None):
+        super().__init__(status_code, detail, request_id, retry_after=retry_after)
+        inner = detail.get("detail") if isinstance(detail, dict) else None
+        inner = inner if isinstance(inner, dict) else {}
+        self.batch_id: str | None = inner.get("batch_id")
+        self.idempotency_key: str | None = inner.get("idempotency_key")
+        self.index: int | None = inner.get("index")
+        self.filename: str | None = inner.get("filename")
 
 
 _ERRORS: dict[int, type[EtchvError]] = {
@@ -184,7 +211,121 @@ class DetectionResult:
     """Hardware that ran detection (``"cpu"`` or ``"gpu"``), when reported."""
 
 
+BatchStatus = Literal["draft", "starting", "processing", "assembling", "completed", "failed", "cancelled", "expired"]
+"""Batch lifecycle. ``completed``, ``failed``, ``cancelled`` and ``expired`` are final."""
+
+BatchItemStatus = Literal["pending", "rejected", "queued", "running", "retrying", "succeeded", "failed"]
+"""One file's state inside a batch."""
+
+
+class BatchItem(TypedDict):
+    """One file for ``submit_batch``: its name (the extension sets the media type),
+    the file as bytes or a path, and the forensic data to embed."""
+    filename: str
+    file: bytes | str | os.PathLike[str]
+    data: dict[str, Any]
+
+
+class ZipBatchItem(TypedDict):
+    """One zip member for ``submit_batch_zip``: its exact path inside the zip and its data."""
+    filename: str
+    data: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BatchEntry:
+    """One file of a batch as the API reports it.
+
+    ``error_code`` explains a ``rejected`` or ``failed`` item (for example
+    ``upload_not_received``, ``invalid_input`` or ``insufficient_credits``);
+    such items are not charged. ``credits`` is what the item cost (0 when
+    refunded) once it was accepted.
+    """
+    index: int
+    filename: str
+    status: BatchItemStatus
+    size: int | None = None
+    upload_id: str | None = None
+    request_id: str | None = None
+    error_code: str | None = None
+    error_detail: str | None = None
+    credits: int | None = None
+    status_url: str | None = None
+    result_url: str | None = None
+    result_expires_at: str | None = None
+
+
+@dataclass(frozen=True)
+class Batch:
+    """A batch of up to 100 files. ``items`` is empty in ``list_batches`` pages.
+
+    ``counts`` holds ``pending``, ``accepted``, ``rejected``, ``succeeded``,
+    ``failed`` and ``in_progress``; ``credits`` holds ``reserved``, ``charged``
+    and ``refunded``. The ``archive_*`` fields are set when the batch was
+    created with ``archive=True``.
+    """
+    batch_id: str
+    status: BatchStatus
+    item_count: int
+    archive: bool
+    accelerator: Accelerator | None
+    webhook_id: str | None
+    storage_destination_id: str | None
+    counts: Mapping[str, int]
+    credits: Mapping[str, int]
+    cancel_requested: bool
+    created_at: str | None
+    started_at: str | None
+    completed_at: str | None
+    upload_expires_at: str | None
+    status_url: str
+    archive_status: str | None = None
+    archive_url: str | None = None
+    archive_expires_at: str | None = None
+    items: tuple[BatchEntry, ...] = ()
+
+    @property
+    def done(self) -> bool:
+        """True once the batch is final: ``completed``, ``failed``, ``cancelled`` or ``expired``."""
+        return self.status in _FINAL_BATCH
+
+
+@dataclass(frozen=True)
+class BatchPage:
+    """One page of ``list_batches``, newest first. Pass ``next_cursor`` as ``before``."""
+    data: tuple[Batch, ...]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
+class BatchItemResult:
+    """One item from ``iter_batch_results``: the verified file, or why there is none.
+
+    ``ok`` is true when ``result`` holds the watermarked file. Otherwise
+    ``error_code`` (and usually ``error_detail``) explain the failure; the
+    item's credits were refunded or never charged.
+    """
+    index: int
+    filename: str
+    status: str
+    request_id: str | None = None
+    result: EmbedResult | None = None
+    error_code: str | None = None
+    error_detail: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.result is not None
+
+
 MB = 1024 * 1024
+MAX_BATCH_ITEMS = 100
+UPLOAD_MIN_BYTES_PER_SECOND = 128 * 1024
+"""Slowest uplink an upload is given time for (about 1 Mbps), on top of the client ``timeout``."""
+ARCHIVE_MAX_BYTES = 1024 * MB + 64 * MB
+"""Largest batch archive the SDK downloads (1 GiB of results plus 64 MiB for the zip itself)."""
+ZIP_BATCH_MAX_BYTES = 55 * MB
+_FINAL_BATCH = ("completed", "failed", "cancelled", "expired")
 LARGE_FILE_THRESHOLD = 40 * MB
 EMBED_MAX_BYTES = 50 * MB
 DETECT_MAX_BYTES = 192 * MB
@@ -257,7 +398,7 @@ class Etchv:
                              files={"file": (filename, image, "application/octet-stream")}, data=data)
 
     def _request(self, path: str, method: str, durable: bool, *, accept: tuple[int, ...] = (),
-                 **kwargs: Any) -> httpx.Response:
+                 retry: tuple[int, ...] = (429, 502, 503, 504), **kwargs: Any) -> httpx.Response:
         async_submission = path.split("?")[0].endswith("/async")
         detection_job = path.split("?")[0] == "watermarks/videos/detect" or "detection-jobs/" in path
         deadline = time.monotonic() + self._timeout
@@ -294,7 +435,7 @@ class Etchv:
                     delay = 1
                 pause(delay)
                 continue
-            if durable and response.status_code in (429, 502, 503, 504) and not (isinstance(detail, dict) and detail.get("status") == "failed"):
+            if durable and response.status_code in retry and not (isinstance(detail, dict) and detail.get("status") == "failed"):
                 delay = _retry_after(response.headers.get("retry-after")) if response.status_code == 429 else None
                 pause(1 if delay is None else min(5, max(.01, delay)))
                 continue
@@ -325,18 +466,25 @@ class Etchv:
         upload = session.get("upload") if isinstance(session, dict) else None
         if not isinstance(upload, dict) or upload.get("method") != "PUT" or not str(upload.get("url", "")).startswith("https://"):
             raise EtchvError(201, "Invalid upload session response", None)
-        deadline = time.monotonic() + self._timeout
+        self._put_upload(upload["url"], file)
+        return {k: v for k, v in session.items() if k != "upload"} | {"status": "received"}
+
+    def _put_upload(self, url: str, file: bytes) -> None:
+        # The upload client has no API key: the signature in the URL is the credential.
+        # ``timeout`` bounds each network read or write (an idle timeout), and retries
+        # stop after ``timeout`` plus the time the file needs on a slow uplink.
+        deadline = time.monotonic() + self._timeout + len(file) / UPLOAD_MIN_BYTES_PER_SECOND
         while True:
             try:
-                response = self._uploads.put(upload["url"], content=file, headers={"Content-Type": "application/octet-stream"},
-                                             timeout=max(.001, deadline - time.monotonic()))
+                response = self._uploads.put(url, content=file, headers={"Content-Type": "application/octet-stream"},
+                                             timeout=self._timeout)
             except httpx.TransportError:
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(1)
                 continue
             if response.status_code == 200:
-                return {k: v for k, v in session.items() if k != "upload"} | {"status": "received"}
+                return
             if response.status_code in (500, 502, 503, 504) and time.monotonic() < deadline:
                 time.sleep(1)
                 continue
@@ -414,6 +562,267 @@ class Etchv:
         """Wait for and return a detection job's result, polling while it is pending (HTTP 202)."""
         _check_id(request_id, r"req_[a-f0-9]{64}", "request ID")
         return self._detection_result(self._request(f"watermarks/detection-jobs/{request_id}/result", "GET", True))
+
+    # Batches
+
+    def submit_batch(self, items: Sequence[BatchItem], *, archive: bool = False, webhook_id: str | None = None,
+                     accelerator: Accelerator | None = None, storage_destination_id: str | None = None,
+                     idempotency_key: str | None = None, upload_concurrency: int = 4) -> Batch:
+        """Watermark up to 100 files as one batch and return it once started.
+
+        Creates the batch, uploads every file to its signed URL
+        (``upload_concurrency`` at a time, never with the API key), then starts
+        it. Each item is ``{"filename", "file", "data"}`` where ``file`` is bytes
+        or a path. Call ``wait_for_batch`` and ``iter_batch_results`` (or
+        ``download_batch_archive`` with ``archive=True``) for the results.
+
+        Transient failures are retried with the same ``idempotency_key``
+        (generated when omitted). If an upload or the start fails for good,
+        ``BatchSubmitError`` carries the ``batch_id`` and ``idempotency_key``:
+        call again with that key and the same items to upload the rest and
+        start. Raises ``GoneError`` (``code`` ``batch_expired``) when resuming a
+        batch that was not started within 24 hours.
+        """
+        files = _batch_files(items)
+        if type(upload_concurrency) is not int or not 1 <= upload_concurrency <= 16:
+            raise ValueError("upload_concurrency must be an integer from 1 to 16")
+        key = _idempotency_key(idempotency_key)
+        body = {"items": [{"filename": name, "size": size, "data": data} for name, _, size, data in files],
+                **_batch_options(archive, webhook_id, accelerator, storage_destination_id)}
+        # 503 means batch uploads are unavailable: raise at once (submit_batch_zip still works).
+        response = self._request("watermarks/batches", "POST", True, retry=(429, 502, 504),
+                                 headers={"Idempotency-Key": key}, json=body)
+        payload = _response_json(response)
+        batch = _batch(payload, response)
+        if batch.status == "expired":
+            raise GoneError(410, {"detail": {
+                "code": "batch_expired", "batch_id": batch.batch_id, "idempotency_key": key,
+                "message": "This batch was not started within 24 hours and expired; "
+                           "submit the files again with a new idempotency_key"}}, response.headers.get("x-request-id"))
+        if batch.status != "draft":
+            return batch  # A replay of a batch that already started (or was canceled).
+        uploads = []
+        for item in payload.get("items") or []:
+            upload = item.get("upload") if isinstance(item, dict) else None
+            if upload is None or item.get("upload_received") is True:
+                continue  # Already uploaded (a resumed batch).
+            index = item.get("index")
+            if (type(index) is not int or not 0 <= index < len(files) or not isinstance(upload, dict)
+                    or upload.get("method") != "PUT" or not str(upload.get("url", "")).startswith("https://")):
+                raise EtchvError(response.status_code, "Invalid batch upload response", response.headers.get("x-request-id"))
+            uploads.append((index, upload["url"]))
+        self._upload_batch(batch.batch_id, key, files, uploads, upload_concurrency)
+        try:
+            return self._batch_call(f"watermarks/batches/{batch.batch_id}/start", "POST", accept=(202,))[0]
+        except (EtchvError, httpx.TransportError) as error:
+            status = error.status_code if isinstance(error, EtchvError) else 0
+            if 400 <= status < 500:
+                raise  # Definitive (for example 410 when the draft expired): resuming would not help.
+            raise _submit_error(error, batch.batch_id, key, "batch_start_failed",
+                                "Starting the batch failed") from error
+
+    def _upload_batch(self, batch_id: str, key: str, files: list[tuple[str, Any, int, dict[str, Any]]],
+                      uploads: list[tuple[int, str]], concurrency: int) -> None:
+        def put(index: int, url: str) -> None:
+            filename, source, size, _ = files[index]
+            try:
+                content = bytes(source) if isinstance(source, (bytes, bytearray)) else Path(source).read_bytes()
+                if len(content) != size:
+                    raise ValueError(f"{filename} changed size after the batch was created")
+                self._put_upload(url, content)
+            except Exception as error:
+                raise _submit_error(error, batch_id, key, "batch_upload_failed", f"Uploading {filename} (item {index}) failed",
+                                    index=index, filename=filename) from error
+        if not uploads:
+            return
+        with ThreadPoolExecutor(max_workers=min(concurrency, len(uploads))) as pool:
+            futures = [pool.submit(put, index, url) for index, url in uploads]
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+
+    def submit_batch_zip(self, zip_file: bytes | str | os.PathLike[str], items: Sequence[ZipBatchItem], *,
+                         archive: bool = False, webhook_id: str | None = None, accelerator: Accelerator | None = None,
+                         storage_destination_id: str | None = None, idempotency_key: str | None = None) -> Batch:
+        """Create and start a batch from one zip (up to 55 MB) of files already together.
+
+        ``items`` lists every member as ``{"filename": <exact member path>, "data": {...}}``;
+        the API refuses members missing from the list and vice versa. The batch
+        starts at once. Retried like ``submit_batch``.
+        """
+        content = bytes(zip_file) if isinstance(zip_file, (bytes, bytearray)) else Path(zip_file).read_bytes()
+        if not content.startswith(b"PK") or len(content) > ZIP_BATCH_MAX_BYTES:
+            raise ValueError(f"zip_file must be a zip of up to {ZIP_BATCH_MAX_BYTES // MB} MB")
+        _check_batch_count(items)
+        members = []
+        for item in items:
+            if not isinstance(item, Mapping) or not isinstance(item.get("filename"), str) or not item["filename"]:
+                raise ValueError("Each zip item needs a filename (the member's path in the zip) and data")
+            members.append({"filename": item["filename"], "data": _batch_data(item.get("data"), item["filename"])})
+        manifest = {"items": members, **_batch_options(archive, webhook_id, accelerator, storage_destination_id)}
+        response = self._request("watermarks/batches/zip", "POST", True, accept=(202,),
+                                 headers={"Idempotency-Key": _idempotency_key(idempotency_key)},
+                                 files={"archive": ("batch.zip", content, "application/zip")},
+                                 data={"manifest": json.dumps(manifest, allow_nan=False)})
+        return _batch(_response_json(response), response)
+
+    def _batch_call(self, path: str, method: str = "GET", **kwargs: Any) -> tuple[Batch, float | None]:
+        response = self._request(path, method, True, **kwargs)
+        return _batch(_response_json(response), response), _retry_after(response.headers.get("retry-after"))
+
+    def get_batch(self, batch_id: str) -> Batch:
+        """Read a batch with every item's status (one request; see ``wait_for_batch`` to poll)."""
+        return self._batch_call(_batch_path(batch_id))[0]
+
+    def wait_for_batch(self, batch_id: str, *, timeout: float = 3600, poll_interval: float | None = None) -> Batch:
+        """Poll a batch until it is final and return it.
+
+        Waits as long as the API's ``Retry-After`` asks between polls (or
+        ``poll_interval`` seconds, whichever is longer). Raises
+        ``DeadlineExceededError`` after ``timeout`` seconds; the batch keeps running.
+        """
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite")
+        if poll_interval is not None and (not math.isfinite(poll_interval) or poll_interval <= 0):
+            raise ValueError("poll_interval must be positive and finite")
+        path = _batch_path(batch_id)
+        deadline = time.monotonic() + timeout
+        while True:
+            batch, retry_after = self._batch_call(path)
+            if batch.done:
+                return batch
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeadlineExceededError(0, {"message": "Client deadline exceeded; the batch is still running",
+                                                "batch_id": batch_id, "status": batch.status}, None)
+            delay = max(1.0, retry_after) if retry_after is not None else (poll_interval or 2)
+            time.sleep(min(max(delay, poll_interval or 0), remaining))
+
+    def iter_batch_results(self, batch_id: str, *, timeout: float = 3600) -> Iterator[BatchItemResult]:
+        """Wait for a batch to finish, then yield one ``BatchItemResult`` per item in order.
+
+        Succeeded items carry the verified file in ``result`` (downloaded as you
+        iterate; results are kept 24 hours). Other items carry ``error_code``.
+        """
+        batch = self.wait_for_batch(batch_id, timeout=timeout)
+        for entry in batch.items:
+            if entry.status == "succeeded" and entry.request_id:
+                yield BatchItemResult(entry.index, entry.filename, entry.status, entry.request_id,
+                                      self.get_embed_result(entry.request_id))
+            else:
+                code = entry.error_code or (batch.status if batch.status in ("cancelled", "expired") else entry.status)
+                yield BatchItemResult(entry.index, entry.filename, entry.status, entry.request_id,
+                                      error_code=code, error_detail=entry.error_detail)
+
+    def download_batch_archive(self, batch_id: str, *, timeout: float = 3600) -> bytes:
+        """Wait for and download the zip of a batch created with ``archive=True``.
+
+        The zip holds every successful result plus ``manifest.json`` listing
+        files and failures. It can reach 1 GB: use ``download_batch_archive_to``
+        to stream it to a file instead of holding it in memory. Raises
+        ``ConflictError`` (``code`` ``archive_not_requested``,
+        ``batch_not_started``, ``archive_too_large`` or ``archive_unavailable``),
+        ``GoneError`` after 24 hours or for an expired draft, and
+        ``DeadlineExceededError`` when it is not ready within ``timeout`` seconds.
+        An archive above ``ARCHIVE_MAX_BYTES`` raises ``EtchvError`` with ``code``
+        ``archive_too_large`` and is not retried.
+        """
+        buffer = io.BytesIO()
+        self._stream_archive(batch_id, timeout, buffer.write)
+        return buffer.getvalue()
+
+    def download_batch_archive_to(self, batch_id: str, destination: str | os.PathLike[str] | BinaryIO, *,
+                                  timeout: float = 3600) -> int:
+        """Like ``download_batch_archive``, but streams the zip to a path or a binary
+        file object and returns the number of bytes written.
+
+        A path is written through a ``.part`` file that replaces it only once the
+        download is complete. Each network read may take up to the client
+        ``timeout``; the download as a whole has no time limit.
+        """
+        if not isinstance(destination, (str, os.PathLike)):
+            return self._stream_archive(batch_id, timeout, destination.write)
+        target = Path(destination)
+        partial = target.with_name(target.name + ".part")
+        try:
+            with partial.open("wb") as handle:
+                written = self._stream_archive(batch_id, timeout, handle.write)
+            os.replace(partial, target)
+        finally:
+            partial.unlink(missing_ok=True)
+        return written
+
+    def _stream_archive(self, batch_id: str, timeout: float, write: Any) -> int:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite")
+        path = _batch_path(batch_id) + "/archive"
+        deadline = time.monotonic() + timeout
+        while True:
+            receiving = False
+            try:
+                # The client timeout applies to each network read, so a large archive on a
+                # slow link keeps going as long as bytes keep arriving.
+                with self._client.stream("GET", path, timeout=self._timeout) as response:
+                    request_id = response.headers.get("x-request-id")
+                    retry_after = _retry_after(response.headers.get("retry-after"))
+                    if response.status_code == 200:
+                        receiving = True
+                        try:
+                            length = int(response.headers.get("content-length", "0"))
+                        except ValueError:
+                            length = 0
+                        if length > ARCHIVE_MAX_BYTES:
+                            raise _archive_too_large(request_id)
+                        return _write_zip(response, write, request_id)
+                    response.read()
+                    if response.status_code == 202:
+                        delay = max(1.0, 2.0 if retry_after is None else retry_after)
+                    elif response.status_code in (429, 502, 503, 504):
+                        delay = max(1.0, 1.0 if retry_after is None else min(5.0, retry_after))
+                    else:
+                        try:
+                            detail = response.json()
+                        except ValueError:
+                            detail = response.text[:1000]
+                        raise _error(response.status_code, detail, request_id, retry_after)
+            except httpx.TransportError:
+                if receiving or time.monotonic() >= deadline:
+                    raise  # Part of the archive may already be written: do not append a second copy.
+                delay = 1.0
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeadlineExceededError(0, {"message": "Client deadline exceeded; the archive is not ready yet",
+                                                "batch_id": batch_id}, None)
+            time.sleep(min(delay, remaining))
+
+    def cancel_batch(self, batch_id: str) -> Batch:
+        """Cancel a batch.
+
+        A draft is canceled at once. In a started batch, files still waiting
+        fail with ``error_code`` ``"cancelled"`` and are refunded; queued and
+        running files finish. The batch then ends as ``cancelled``.
+        """
+        return self._batch_call(_batch_path(batch_id) + "/cancel", "POST")[0]
+
+    def list_batches(self, *, limit: int = 20, before: str | None = None) -> BatchPage:
+        """List batches newest first (``limit`` 1–50), without items. Pass ``next_cursor`` as ``before``."""
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("limit must be an integer from 1 to 50")
+        params: dict[str, Any] = {"limit": limit}
+        if before is not None:
+            _check_id(before, r"bat_[a-f0-9]{32}", "batch cursor")
+            params["before"] = before
+        response = self._request("watermarks/batches", "GET", True, params=params)
+        payload = _response_json(response)
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise EtchvError(200, "Invalid batch list response", response.headers.get("x-request-id"))
+        cursor = payload.get("next_cursor")
+        return BatchPage(tuple(_batch(entry, response) for entry in payload["data"]),
+                         cursor if isinstance(cursor, str) else None)
 
     # Assets
 
@@ -686,6 +1095,155 @@ class Etchv:
 def _check_id(value: Any, pattern: str, label: str) -> None:
     if not isinstance(value, str) or not re.fullmatch(pattern, value):
         raise ValueError(f"Invalid {label}")
+
+
+def _write_zip(response: httpx.Response, write: Any, request_id: str | None) -> int:
+    total, head = 0, b""
+    for chunk in response.iter_bytes():
+        if total == 0:
+            head += chunk
+            if len(head) < 2:
+                continue
+            if not head.startswith(b"PK"):
+                raise EtchvError(200, "Invalid archive response", request_id)
+            chunk = head
+        if total + len(chunk) > ARCHIVE_MAX_BYTES:
+            raise _archive_too_large(request_id)
+        write(chunk)
+        total += len(chunk)
+    if total == 0:
+        raise EtchvError(200, "Invalid archive response", request_id)
+    return total
+
+
+def _archive_too_large(request_id: str | None) -> EtchvError:
+    return EtchvError(200, {"detail": {"code": "archive_too_large", "message": f"The archive is larger than "
+                                       f"{ARCHIVE_MAX_BYTES // MB} MiB; download each item's result instead"}}, request_id)
+
+
+def _submit_error(error: BaseException, batch_id: str, key: str, code: str, what: str, *,
+                  index: int | None = None, filename: str | None = None) -> BatchSubmitError:
+    status = error.status_code if isinstance(error, EtchvError) else 0
+    reason = f"HTTP {status}" if status else type(error).__name__
+    detail: dict[str, Any] = {
+        "code": code, "batch_id": batch_id, "idempotency_key": key,
+        "message": f"{what} ({reason}); call submit_batch again with idempotency_key={key!r} and the same items to resume"}
+    if index is not None:
+        detail.update(index=index, filename=filename)
+    return BatchSubmitError(status, {"detail": detail}, getattr(error, "request_id", None),
+                            retry_after=getattr(error, "retry_after", None))
+
+
+def _batch_path(batch_id: str) -> str:
+    _check_id(batch_id, r"bat_[a-f0-9]{32}", "batch ID")
+    return f"watermarks/batches/{batch_id}"
+
+
+def _idempotency_key(key: str | None) -> str:
+    if key is None:
+        return uuid4().hex
+    if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", key):
+        raise ValueError("idempotency_key must be 8–128 letters, digits, hyphens or underscores")
+    return key
+
+
+def _check_batch_count(items: Any) -> None:
+    if isinstance(items, (str, bytes, Mapping)) or not isinstance(items, Sequence):
+        raise ValueError("items must be a list of batch items")
+    if not 1 <= len(items) <= MAX_BATCH_ITEMS:
+        raise ValueError(f"A batch takes 1 to {MAX_BATCH_ITEMS} files; got {len(items)}. "
+                         f"Split larger sets into several batches.")
+
+
+def _batch_data(data: Any, filename: str) -> dict[str, Any]:
+    if not isinstance(data, dict) or not data:
+        raise ValueError(f"{filename}: data must be a non-empty JSON object")
+    try:
+        json.dumps(data, allow_nan=False)
+    except (TypeError, ValueError):
+        raise ValueError(f"{filename}: data must contain JSON values") from None
+    return data
+
+
+def _batch_files(items: Any) -> list[tuple[str, Any, int, dict[str, Any]]]:
+    _check_batch_count(items)
+    files = []
+    for item in items:
+        if not isinstance(item, Mapping) or not isinstance(item.get("filename"), str) or not item["filename"]:
+            raise ValueError("Each batch item needs a filename, a file and data")
+        filename, source = item["filename"], item.get("file")
+        if isinstance(source, (bytes, bytearray)):
+            size = len(source)
+        elif isinstance(source, (str, os.PathLike)):
+            size = os.stat(source).st_size
+        else:
+            raise ValueError(f"{filename}: file must be bytes or a path")
+        if size < 1:
+            raise ValueError(f"{filename}: file is empty")
+        files.append((filename, source, size, _batch_data(item.get("data"), filename)))
+    return files
+
+
+def _batch_options(archive: bool, webhook_id: str | None, accelerator: Accelerator | None,
+                   storage_destination_id: str | None) -> dict[str, Any]:
+    if type(archive) is not bool:
+        raise ValueError("archive must be a boolean")
+    options: dict[str, Any] = {"archive": archive}
+    if webhook_id is not None:
+        _check_id(webhook_id, r"wh_[a-f0-9]{32}", "webhook ID")
+        options["webhook_id"] = webhook_id
+    if accelerator is not None:
+        if accelerator not in ("cpu", "gpu"):
+            raise ValueError('accelerator must be "cpu" or "gpu"')
+        options["accelerator"] = accelerator
+    if storage_destination_id is not None:
+        if archive:
+            raise ValueError("archive and storage_destination_id cannot be combined")
+        _check_id(storage_destination_id, r"dst_[a-f0-9]{32}", "storage destination ID")
+        options["storage_destination_id"] = storage_destination_id
+    return options
+
+
+def _response_json(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        raise EtchvError(response.status_code, "Invalid JSON response", response.headers.get("x-request-id")) from None
+
+
+def _optional_str(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _batch(payload: Any, response: httpx.Response) -> Batch:
+    if (not isinstance(payload, dict) or not re.fullmatch(r"bat_[a-f0-9]{32}", str(payload.get("batch_id", "")))
+            or not isinstance(payload.get("status"), str) or not isinstance(payload.get("items", []), list)):
+        raise EtchvError(response.status_code, "Invalid batch response", response.headers.get("x-request-id"))
+    entries = []
+    for item in payload.get("items", []):
+        if not isinstance(item, dict) or type(item.get("index")) is not int or not isinstance(item.get("status"), str):
+            raise EtchvError(response.status_code, "Invalid batch item", response.headers.get("x-request-id"))
+        text = {name: _optional_str(item.get(name)) for name in (
+            "upload_id", "request_id", "error_code", "error_detail", "status_url", "result_url", "result_expires_at")}
+        entries.append(BatchEntry(
+            index=item["index"], filename=str(item.get("filename", "")), status=item["status"],
+            size=item["size"] if type(item.get("size")) is int else None,
+            credits=item["credits"] if type(item.get("credits")) is int else None, **text))
+    counts, credits = payload.get("counts"), payload.get("credits")
+    return Batch(
+        batch_id=payload["batch_id"], status=payload["status"],
+        item_count=payload["item_count"] if type(payload.get("item_count")) is int else len(entries),
+        archive=payload.get("archive") is True, accelerator=_accelerator(payload.get("accelerator")),
+        webhook_id=_optional_str(payload.get("webhook_id")),
+        storage_destination_id=_optional_str(payload.get("storage_destination_id")),
+        counts=dict(counts) if isinstance(counts, dict) else {}, credits=dict(credits) if isinstance(credits, dict) else {},
+        cancel_requested=payload.get("cancel_requested") is True,
+        created_at=_optional_str(payload.get("created_at")), started_at=_optional_str(payload.get("started_at")),
+        completed_at=_optional_str(payload.get("completed_at")),
+        upload_expires_at=_optional_str(payload.get("upload_expires_at")),
+        status_url=_optional_str(payload.get("status_url")) or f"/watermarks/batches/{payload['batch_id']}",
+        archive_status=_optional_str(payload.get("archive_status")), archive_url=_optional_str(payload.get("archive_url")),
+        archive_expires_at=_optional_str(payload.get("archive_expires_at")), items=tuple(entries))
 
 
 def _accelerator(value: Any) -> Accelerator | None:

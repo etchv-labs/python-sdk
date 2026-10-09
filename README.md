@@ -78,6 +78,60 @@ result = client.get_embed_result(job["request_id"])  # waits for the file
 the same way. Reusing an `idempotency_key` with the same input returns the saved
 result (kept 24 hours) without another charge.
 
+## Many files at once
+
+A batch watermarks up to 100 images, PDFs and videos with one call.
+`submit_batch` creates the batch, uploads every file to its own signed URL
+(four at a time, never with your API key) and starts it. Each item has its own
+forensic data; the filename's extension sets the media type.
+
+```python
+from pathlib import Path
+
+batch = client.submit_batch(
+    [{"filename": p.name, "file": p, "data": {"recipient": p.stem}} for p in Path("in").glob("*.pdf")],
+    archive=True,  # also zip every result into one download
+)
+client.wait_for_batch(batch.batch_id, timeout=1800)  # honors Retry-After between polls
+
+for item in client.iter_batch_results(batch.batch_id):
+    if item.ok:
+        Path("out", item.result.filename).write_bytes(item.result.image)
+    else:
+        print(item.filename, item.error_code)  # not charged, or refunded
+
+client.download_batch_archive_to(batch.batch_id, "out.zip")  # streams to disk
+```
+
+`file` is bytes or a path. A batch costs the same credits per file as single
+requests. Files that never arrive or fail their checks are rejected
+(`upload_not_received`, `invalid_input`, ...) without a charge, and failed
+files are refunded, so one bad file never stops the rest. Results are kept 24
+hours; the archive (with `archive=True`) holds every successful result plus
+`manifest.json` and is limited to 1 GB. `download_batch_archive_to` streams it
+to a path or file object; `download_batch_archive` returns it as bytes.
+
+More than 100 items raise `ValueError` before any request; split larger sets
+into several batches. Pass `webhook_id` to get one `watermark.batch.completed`,
+`watermark.batch.failed` or `watermark.batch.cancelled` event when the batch
+ends, and `accelerator` or `storage_destination_id` as for single files.
+Retries reuse the same `idempotency_key` (generated when omitted). If an upload
+or the start still fails, `BatchSubmitError` carries `batch_id` and
+`idempotency_key`; calling `submit_batch` again with that key and the same items
+uploads only the files that have not arrived and starts the batch. A batch not
+started within 24 hours expires, and resuming it raises `GoneError`.
+
+Files already in one zip (up to 55 MB) can go in one request; list every
+member:
+
+```python
+batch = client.submit_batch_zip(Path("in.zip"), [{"filename": "in/a.png", "data": {"recipient": "a"}}])
+```
+
+Also: `get_batch`, `cancel_batch` (files still waiting are canceled and
+refunded; queued and running files finish) and
+`list_batches(limit=20, before=...)`.
+
 ## Also included
 
 - API key check: `check_api_key()` (no credits used).
