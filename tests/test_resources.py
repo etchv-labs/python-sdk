@@ -25,10 +25,10 @@ def client(handler, **options):
 class VersionTests(unittest.TestCase):
     def test_version_and_user_agent(self):
         project = tomllib.loads(Path(__file__).parents[1].joinpath('pyproject.toml').read_text())
-        self.assertEqual(etchv.__version__, '1.0.0')
+        self.assertEqual(etchv.__version__, '1.1.0')
         self.assertEqual(project['project']['version'], etchv.__version__)
         def handle(request):
-            self.assertEqual(request.headers['user-agent'], 'etchv-python/1.0.0')
+            self.assertEqual(request.headers['user-agent'], 'etchv-python/1.1.0')
             self.assertEqual(request.url.path, '/auth/api-key')
             return httpx.Response(200, json={'organization_id': 'org_1', 'key_id': 'key_1', 'scopes': ['watermarks:embed']})
         with client(handle) as sdk:

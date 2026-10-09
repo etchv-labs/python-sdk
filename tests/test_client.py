@@ -76,7 +76,8 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(ValueError): sdk.embed_image(PNG, {})
             with self.assertRaises(ValueError): sdk.embed_image(PNG, {'value':float('nan')})
             with self.assertRaises(ValueError): sdk.detect_image(b'')
-            with self.assertRaisesRegex(ValueError, '50 MB'): sdk.detect_image(bytes(50 * 1024 * 1024 + 1))
+            with self.assertRaisesRegex(ValueError, '50 MB'): sdk.embed_image(bytes(50 * 1024 * 1024 + 1), {'a': 1})
+            with self.assertRaisesRegex(ValueError, '192 MB'): sdk.detect_image(bytes(192 * 1024 * 1024 + 1))
 
     def test_durable_retry_and_trusted_poll(self):
         calls = []

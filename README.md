@@ -33,8 +33,23 @@ with Etchv(os.environ["ETCHV_API_KEY"]) as client:
 
 Use `embed_document` / `detect_document` for PDFs and `embed_video` /
 `detect_video` for H.264 MP4/MOV. Image uploads are limited to 50 MB; PDF and
-video uploads to 20 MB. Detection recovers a SHA-256 digest of your data, not
-the data itself.
+video uploads to 20 MB. Detection takes the files Etchv delivered: up to 192 MB
+for images, 64 MB for PDFs and 100 MB for video. Detection recovers a SHA-256
+digest of your data, not the data itself.
+
+## Large files
+
+Files over 40 MB are uploaded once to a signed URL and then referenced by ID,
+so the request never carries the file. This is automatic in every embed,
+detect and submit method; retries reuse the same upload. Image and PDF
+detection above 95 MB runs as a background job and the call waits for it.
+Change the threshold with `Etchv(..., large_file_threshold=...)`, or upload
+explicitly:
+
+```python
+upload = client.upload_file("detect", delivered, filename="delivered.tiff")
+upload["upload_id"]  # send as the upload_id form field instead of file
+```
 
 ## GPU processing
 

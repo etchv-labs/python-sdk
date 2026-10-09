@@ -15,7 +15,7 @@ from urllib.parse import urlsplit, urlencode
 
 import httpx
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 USER_AGENT = f"etchv-python/{__version__}"
 
 Accelerator = Literal["cpu", "gpu"]
@@ -184,15 +184,26 @@ class DetectionResult:
     """Hardware that ran detection (``"cpu"`` or ``"gpu"``), when reported."""
 
 
+MB = 1024 * 1024
+LARGE_FILE_THRESHOLD = 40 * MB
+EMBED_MAX_BYTES = 50 * MB
+DETECT_MAX_BYTES = 192 * MB
+SYNC_DETECT_MAX_BYTES = 95 * MB
+_UPLOAD_KINDS = {"images": "image", "documents": "document", "videos": "video"}
+
+
 class Etchv:
     """Synchronous Etchv API client authenticated with an ``X-API-Key``.
 
     ``timeout`` (seconds) bounds each call, including automatic polling of
-    durable jobs. Use as a context manager or call ``close()``.
+    durable jobs. Use as a context manager or call ``close()``. Files larger
+    than ``large_file_threshold`` bytes are sent through an upload session
+    (``upload_file``) instead of in the request body.
     """
 
     def __init__(self, api_key: str, *, base_url: str = "https://api.etchv.com",
-                 timeout: float = 120, transport: httpx.BaseTransport | None = None):
+                 timeout: float = 120, transport: httpx.BaseTransport | None = None,
+                 large_file_threshold: int = LARGE_FILE_THRESHOLD):
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("api_key is required")
         url = urlsplit(base_url)
@@ -201,14 +212,21 @@ class Etchv:
             raise ValueError("base_url must use HTTPS (HTTP is allowed for localhost)")
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be positive and finite")
+        if type(large_file_threshold) is not int or large_file_threshold < 1:
+            raise ValueError("large_file_threshold must be a positive number of bytes")
         self._timeout = timeout
+        self._large_file_threshold = large_file_threshold
+        # Signed upload URLs carry their own authorization: never send the API key there.
+        self._uploads = httpx.Client(timeout=timeout, headers={"User-Agent": USER_AGENT}, transport=transport,
+                                     follow_redirects=False)
         self._client = httpx.Client(base_url=base_url.rstrip("/") + "/", timeout=timeout,
                                     headers={"X-API-Key": api_key, "User-Agent": USER_AGENT}, transport=transport,
                                     follow_redirects=False)
 
     def close(self) -> None:
-        """Close the underlying HTTP connection pool."""
+        """Close the underlying HTTP connection pools."""
         self._client.close()
+        self._uploads.close()
 
     def __enter__(self) -> Etchv:
         return self
@@ -218,14 +236,23 @@ class Etchv:
 
     def _post(self, path: str, image: bytes, filename: str,
               data: dict[str, str] | None, idempotency_key: str | None) -> httpx.Response:
-        if not isinstance(image, bytes) or not image or len(image) > 50 * 1024 * 1024:
-            raise ValueError("image must contain 1 byte to 50 MB of encoded image bytes")
+        route = path.split("?")[0]
+        detect = "/detect" in route
+        limit = DETECT_MAX_BYTES if detect else EMBED_MAX_BYTES
+        if not isinstance(image, bytes) or not image or len(image) > limit:
+            raise ValueError(f"file must contain 1 byte to {limit // MB} MB")
         headers = {}
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
         durable = path.split("?")[0].endswith("/async") or path.split("?")[0] in ("watermarks/images", "watermarks/documents", "watermarks/videos", "watermarks/videos/detect")
         if durable and not idempotency_key:
             headers["Idempotency-Key"] = uuid4().hex
+        if len(image) > self._large_file_threshold:
+            # Too large for one request body: upload once, then every retry sends the same upload_id.
+            kind = "detect" if detect else _UPLOAD_KINDS[route.split("/")[1]]
+            upload = self.upload_file(kind, image, filename=filename)
+            return self._request(path, "POST", durable, headers=headers,
+                                 data={**(data or {}), "upload_id": upload["upload_id"]})
         return self._request(path, "POST", durable, headers=headers,
                              files={"file": (filename, image, "application/octet-stream")}, data=data)
 
@@ -280,6 +307,40 @@ class Etchv:
             return response.json()
         except ValueError:
             raise EtchvError(response.status_code, "Invalid JSON response", response.headers.get("x-request-id")) from None
+
+    # Upload sessions
+
+    def upload_file(self, kind: str, file: bytes, *, filename: str = "file") -> dict[str, Any]:
+        """Upload a file once to a signed URL and return its session (``upload_id``, ``status``).
+
+        ``kind`` is ``"image"``, ``"document"``, ``"video"`` or ``"detect"``. Pass the
+        ``upload_id`` to an embed or detect request instead of the file. The embed and
+        detect methods do this automatically above ``large_file_threshold``.
+        """
+        if kind not in ("image", "document", "video", "detect"):
+            raise ValueError('kind must be "image", "document", "video" or "detect"')
+        if not isinstance(file, bytes) or not file:
+            raise ValueError("file must contain at least 1 byte")
+        session = self._json("uploads", "POST", json={"kind": kind, "filename": filename, "size": len(file)})
+        upload = session.get("upload") if isinstance(session, dict) else None
+        if not isinstance(upload, dict) or upload.get("method") != "PUT" or not str(upload.get("url", "")).startswith("https://"):
+            raise EtchvError(201, "Invalid upload session response", None)
+        deadline = time.monotonic() + self._timeout
+        while True:
+            try:
+                response = self._uploads.put(upload["url"], content=file, headers={"Content-Type": "application/octet-stream"},
+                                             timeout=max(.001, deadline - time.monotonic()))
+            except httpx.TransportError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
+                continue
+            if response.status_code == 200:
+                return {k: v for k, v in session.items() if k != "upload"} | {"status": "received"}
+            if response.status_code in (500, 502, 503, 504) and time.monotonic() < deadline:
+                time.sleep(1)
+                continue
+            raise _error(response.status_code, response.text[:1000] or "Upload refused", None)
 
     # Account
 
@@ -585,6 +646,10 @@ class Etchv:
 
     def _detect_media(self, media: str, image: bytes, filename: str, idempotency_key: str | None,
                       accelerator: Accelerator | None) -> DetectionResult:
+        if media != "videos" and isinstance(image, bytes) and len(image) > SYNC_DETECT_MAX_BYTES:
+            # Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job.
+            receipt = self.submit_detection(media, image, filename=filename, idempotency_key=idempotency_key, accelerator=accelerator)
+            return self.get_detection_result(receipt["request_id"])
         path = self._accelerator_path(f"watermarks/{media}/detect", accelerator)
         return self._detection_result(self._post(path, image, filename, None, idempotency_key))
 
