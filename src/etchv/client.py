@@ -177,7 +177,8 @@ def verify_webhook(payload: bytes, headers: Mapping[str, str], signing_secret: s
 
 @dataclass(frozen=True)
 class EmbedResult:
-    """A verified watermarked file. ``image`` holds native image, PDF or video bytes."""
+    """A verified watermarked file. ``image`` holds native image, PDF or video bytes;
+    ``watermark_id`` is its unique forensic watermark ID (64 hexadecimal characters)."""
     image: bytes
     watermark_id: str
     request_id: str | None
