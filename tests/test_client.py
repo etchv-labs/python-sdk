@@ -31,6 +31,41 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(result.image, pdf)
             self.assertEqual(result.content_type, "application/pdf")
 
+    def test_new_video_and_office_results(self):
+        tail = b"\0test\xffbytes"
+        ts = bytearray(377); ts[0] = ts[188] = ts[376] = 0x47
+        samples = [
+            ("videos", "video/webm", b"\x1a\x45\xdf\xa3" + tail, "webm"),
+            ("videos", "video/x-matroska", b"\x1a\x45\xdf\xa3" + tail, "mkv"),
+            ("videos", "video/mpeg", b"\x00\x00\x01\xba" + tail, "mpg"),
+            ("videos", "video/mp2t", bytes(ts), "ts"),
+            ("videos", "video/x-msvideo", b"RIFF\0\0\0\0AVI " + tail, "avi"),
+            ("documents", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", b"PK\x03\x04word/" + tail, "docx"),
+            ("documents", "application/vnd.openxmlformats-officedocument.presentationml.presentation", b"PK\x03\x04ppt/" + tail, "pptx"),
+        ]
+        for media, mime, raw, extension in samples:
+            for body, valid in ((raw, True), (b"%PDF-1.7" + tail, False)):
+                def handle(request):
+                    self.assertEqual(request.url.path, f"/watermarks/{media}")
+                    return httpx.Response(200, content=body, headers={"content-type": mime, "x-watermark-id": ID})
+                with Etchv("test-key", transport=httpx.MockTransport(handle)) as sdk:
+                    embed = sdk.embed_video if media == "videos" else sdk.embed_document
+                    if valid:
+                        result = embed(body, {"recipient": "test"})
+                        self.assertEqual((result.content_type, result.filename), (mime, f"image-watermarked.{extension}"))
+                    else:
+                        with self.assertRaises(EtchvError):
+                            embed(body, {"recipient": "test"})
+
+    def test_document_detection_units_carry_part(self):
+        def handle(request):
+            return httpx.Response(200, json={"watermarked": True, "confidence": .9, "watermark_id": ID, "units": [
+                {"index": 0, "watermarked": True, "confidence": .9, "watermark_id": ID, "part": "word/media/image1.png"},
+                {"index": 1, "watermarked": False, "confidence": .5, "watermark_id": None, "part": None}]})
+        with Etchv("test-key", transport=httpx.MockTransport(handle)) as sdk:
+            result = sdk.detect_document(b"PK\x03\x04word/", filename="report.docx")
+        self.assertEqual([unit.part for unit in result.units], ["word/media/image1.png", None])
+
     def test_video_detection_polls_scoped_result(self):
         calls=[]
         request_id="req_"+"c"*64

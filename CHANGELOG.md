@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0
+
+- `embed_video` and `detect_video` results can now be WebM, Matroska (`.mkv`),
+  MPEG program stream (`.mpg`), MPEG transport stream (`.ts`) or AVI, besides
+  MP4 and MOV. Each result's content type is checked against the file's bytes.
+- `embed_document` and `detect_document` take DOCX and PPTX, besides PDF.
+- `DetectionUnit.part` names the DOCX/PPTX package part that carries a unit;
+  it is `None` for other files.
+
 ## 1.2.0
 
 - Batches: watermark up to 100 files in one call. `submit_batch(items, ...)`

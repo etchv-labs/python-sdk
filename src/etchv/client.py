@@ -19,7 +19,7 @@ from urllib.parse import urlsplit, urlencode
 
 import httpx
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 USER_AGENT = f"etchv-python/{__version__}"
 
 Accelerator = Literal["cpu", "gpu"]
@@ -177,7 +177,7 @@ def verify_webhook(payload: bytes, headers: Mapping[str, str], signing_secret: s
 
 @dataclass(frozen=True)
 class EmbedResult:
-    """A verified watermarked file. ``image`` holds native image, PDF or video bytes;
+    """A verified watermarked file. ``image`` holds native image, document or video bytes;
     ``watermark_id`` is its unique forensic watermark ID (64 hexadecimal characters)."""
     image: bytes
     watermark_id: str
@@ -193,11 +193,13 @@ class EmbedResult:
 
 @dataclass(frozen=True)
 class DetectionUnit:
-    """Detection for one frame, page or layered composite."""
+    """Detection for one frame, page, layered composite or DOCX/PPTX unit."""
     index: int
     watermarked: bool
     confidence: float
     watermark_id: str | None
+    part: str | None = None
+    """DOCX/PPTX only: the package part that carries this unit."""
 
 
 @dataclass(frozen=True)
@@ -1004,13 +1006,13 @@ class Etchv:
     def embed_document(self, document: bytes, data: dict[str, Any], *, filename: str = "document.pdf",
                        idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None,
                        accelerator: Accelerator | None = None) -> EmbedResult:
-        """Watermark a PDF and wait for the verified PDF (see ``embed_image``)."""
+        """Watermark a PDF, DOCX or PPTX and wait for the verified file (see ``embed_image``)."""
         return self._embed_media("documents", document, data, filename, idempotency_key, storage_destination_id, storage_key, accelerator)
 
     def embed_video(self, video: bytes, data: dict[str, Any], *, filename: str = "video.mp4",
                     idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None,
                     accelerator: Accelerator | None = None) -> EmbedResult:
-        """Watermark an MP4/MOV video and wait for the verified video (see ``embed_image``)."""
+        """Watermark an MP4, MOV, WebM, Matroska, MPEG or AVI video and wait for the verified video (see ``embed_image``)."""
         return self._embed_media("videos", video, data, filename, idempotency_key, storage_destination_id, storage_key, accelerator)
 
     def _embed_media(self, media: str, image: bytes, data: dict[str, Any], filename: str,
@@ -1046,7 +1048,7 @@ class Etchv:
 
     def detect_document(self, document: bytes, *, filename: str = "document.pdf",
                         idempotency_key: str | None = None, accelerator: Accelerator | None = None) -> DetectionResult:
-        """Detect watermarks page by page in a PDF. Not retried automatically."""
+        """Detect watermarks in a PDF (page by page), DOCX or PPTX. Not retried automatically."""
         return self._detect_media("documents", document, filename, idempotency_key, accelerator)
 
     def detect_video(self, video: bytes, *, filename: str = "video.mp4",
@@ -1086,9 +1088,10 @@ class Etchv:
                     or type(unit.get("confidence")) not in (int, float)
                     or not 0 <= unit["confidence"] <= 1
                     or (unit["watermarked"] and not _valid_id(unit.get("watermark_id")))
-                    or (not unit["watermarked"] and unit.get("watermark_id") is not None)):
+                    or (not unit["watermarked"] and unit.get("watermark_id") is not None)
+                    or not isinstance(unit.get("part", ""), (str, type(None)))):
                 raise EtchvError(200, "Invalid detection units", response.headers.get("x-request-id"))
-            units.append(DetectionUnit(index, unit["watermarked"], unit["confidence"], unit.get("watermark_id")))
+            units.append(DetectionUnit(index, unit["watermarked"], unit["confidence"], unit.get("watermark_id"), unit.get("part")))
         accelerator = _accelerator(response.headers.get("x-etchv-accelerator")) or _accelerator(result.get("accelerator"))
         return DetectionResult(detected, confidence, identifier, response.headers.get("x-request-id"), tuple(units), accelerator)
 
@@ -1269,9 +1272,20 @@ def _valid_id(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
 
 
+_OFFICE_TYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+}
+
+
 def _image_extension(data: bytes, mime: str) -> str | None:
     if mime in ("video/mp4", "video/quicktime") and data[4:8] == b"ftyp": return "mp4" if mime == "video/mp4" else "mov"
     if mime == "application/pdf" and data.startswith(b"%PDF-"): return "pdf"
+    if data.startswith(b"PK\x03\x04") and mime in _OFFICE_TYPES: return _OFFICE_TYPES[mime]
+    if mime in ("video/webm", "video/x-matroska") and data.startswith(b"\x1a\x45\xdf\xa3"): return "webm" if mime == "video/webm" else "mkv"
+    if mime == "video/mpeg" and data.startswith(b"\x00\x00\x01\xba"): return "mpg"
+    if mime == "video/mp2t" and len(data) > 376 and data[0] == data[188] == data[376] == 0x47: return "ts"
+    if mime == "video/x-msvideo" and data[:4] == b"RIFF" and data[8:12] == b"AVI ": return "avi"
     signatures = {
         "image/png": ((b"\x89PNG\r\n\x1a\n",), "png"),
         "image/jpeg": ((b"\xff\xd8\xff",), "jpg"),

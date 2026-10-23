@@ -31,18 +31,19 @@ with Etchv(os.environ["ETCHV_API_KEY"]) as client:
     print(detection.watermarked, detection.watermark_id, detection.confidence)
 ```
 
-Use `embed_document` / `detect_document` for PDFs and `embed_video` /
-`detect_video` for H.264 MP4/MOV. Image uploads are limited to 50 MB; PDF and
-video uploads to 20 MB. Detection takes the files Etchv delivered: up to 192 MB
-for images, 64 MB for PDFs and 100 MB for video. Detection recovers a SHA-256
-digest of your data, not the data itself.
+Use `embed_document` / `detect_document` for PDF, DOCX and PPTX and
+`embed_video` / `detect_video` for MP4, MOV, WebM, Matroska, MPEG and AVI
+([supported codecs](https://etchv.com/docs/api/videos#supported-files)). Image
+uploads are limited to 50 MB; document and video uploads to 20 MB. Detection takes the files Etchv delivered: up to 192 MB
+for images, 64 MB for PDFs and 100 MB for DOCX, PPTX and video. Detection
+recovers a SHA-256 digest of your data, not the data itself.
 
 ## Large files
 
 Files over 40 MB are uploaded once to a signed URL and then referenced by ID,
 so the request never carries the file. This is automatic in every embed,
-detect and submit method; retries reuse the same upload. Image and PDF
-detection above 95 MB runs as a background job and the call waits for it.
+detect and submit method; retries reuse the same upload. Image and
+document detection above 95 MB runs as a background job and the call waits for it.
 Change the threshold with `Etchv(..., large_file_threshold=...)`, or upload
 explicitly:
 
@@ -80,7 +81,8 @@ result (kept 24 hours) without another charge.
 
 ## Many files at once
 
-A batch watermarks up to 100 images, PDFs and videos with one call.
+A batch watermarks up to 100 images, PDF, DOCX and PPTX documents, and videos
+with one call.
 `submit_batch` creates the batch, uploads every file to its own signed URL
 (four at a time, never with your API key) and starts it. Each item has its own
 forensic data; the filename's extension sets the media type.
