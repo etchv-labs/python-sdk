@@ -19,11 +19,22 @@ from urllib.parse import urlsplit, urlencode
 
 import httpx
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 USER_AGENT = f"etchv-python/{__version__}"
 
 Accelerator = Literal["cpu", "gpu"]
 """Processing hardware for embedding and detection: ``"cpu"`` (default) or ``"gpu"``."""
+_ACCELERATORS = ("cpu", "gpu")
+
+ActiveContent = Literal["keep", "remove_auto_run"]
+"""What PDF watermarking does with scripts and actions: ``"keep"`` (default) returns them as
+uploaded; ``"remove_auto_run"`` removes what a viewer runs by itself. PDF only."""
+_ACTIVE_CONTENT = ("keep", "remove_auto_run")
+
+
+def _choice(name: str, value: str | None, choices: tuple[str, ...]) -> None:
+    if value is not None and value not in choices:
+        raise ValueError(f"{name} must be " + " or ".join(f'"{choice}"' for choice in choices))
 
 
 class EtchvError(RuntimeError):
@@ -286,6 +297,8 @@ class Batch:
     archive_url: str | None = None
     archive_expires_at: str | None = None
     items: tuple[BatchEntry, ...] = ()
+    active_content: ActiveContent | None = None
+    """What the batch's PDFs keep of their scripts and actions (``"keep"`` or ``"remove_auto_run"``)."""
 
     @property
     def done(self) -> bool:
@@ -514,26 +527,37 @@ class Etchv:
         return f"watermarks/{media}{'/detect' if detect else ''}/async" + (f"?webhook_id={webhook_id}" if webhook_id else "")
 
     @staticmethod
-    def _accelerator_path(path: str, accelerator: Accelerator | None) -> str:
-        if accelerator is None:
+    def _option_path(path: str, name: str, value: str | None, choices: tuple[str, ...]) -> str:
+        if value is None:
             return path
-        if accelerator not in ("cpu", "gpu"):
-            raise ValueError('accelerator must be "cpu" or "gpu"')
-        return path + ("&" if "?" in path else "?") + f"accelerator={accelerator}"
+        _choice(name, value, choices)
+        return path + ("&" if "?" in path else "?") + f"{name}={value}"
+
+    @classmethod
+    def _accelerator_path(cls, path: str, accelerator: Accelerator | None) -> str:
+        return cls._option_path(path, "accelerator", accelerator, _ACCELERATORS)
+
+    @classmethod
+    def _active_content_path(cls, path: str, media: str, active_content: ActiveContent | None) -> str:
+        if active_content is not None and media != "documents":
+            raise ValueError("active_content applies to PDF documents only")
+        return cls._option_path(path, "active_content", active_content, _ACTIVE_CONTENT)
 
     def submit_embed(self, media: str, file: bytes, data: dict[str, Any], *, filename: str = "file",
                      idempotency_key: str | None = None, webhook_id: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None,
-                     accelerator: Accelerator | None = None) -> dict[str, Any]:
+                     accelerator: Accelerator | None = None, active_content: ActiveContent | None = None) -> dict[str, Any]:
         """Submit a background embedding job and return its 202 JSON receipt without polling.
 
         ``media`` is ``"images"``, ``"documents"`` or ``"videos"``. Transient
         failures are retried with the same idempotency key (generated when omitted).
-        ``accelerator="gpu"`` requests GPU processing (see ``embed_image``).
+        ``accelerator="gpu"`` requests GPU processing (see ``embed_image``);
+        ``active_content`` applies to PDFs (see ``embed_document``).
         """
         if not isinstance(data, dict) or not data:
             raise ValueError("data must be a non-empty JSON object")
         path = self._storage_path(self._async_path(media, False, webhook_id), storage_destination_id, storage_key)
-        return self._post(self._accelerator_path(path, accelerator), file, filename,
+        path = self._active_content_path(self._accelerator_path(path, accelerator), media, active_content)
+        return self._post(path, file, filename,
                           {"data": json.dumps(data, allow_nan=False)}, idempotency_key).json()
 
     def submit_detection(self, media: str, file: bytes, *, filename: str = "file",
@@ -570,7 +594,8 @@ class Etchv:
 
     def submit_batch(self, items: Sequence[BatchItem], *, archive: bool = False, webhook_id: str | None = None,
                      accelerator: Accelerator | None = None, storage_destination_id: str | None = None,
-                     idempotency_key: str | None = None, upload_concurrency: int = 4) -> Batch:
+                     idempotency_key: str | None = None, upload_concurrency: int = 4,
+                     active_content: ActiveContent | None = None) -> Batch:
         """Watermark up to 100 files as one batch and return it once started.
 
         Creates the batch, uploads every file to its signed URL
@@ -585,13 +610,16 @@ class Etchv:
         call again with that key and the same items to upload the rest and
         start. Raises ``GoneError`` (``code`` ``batch_expired``) when resuming a
         batch that was not started within 24 hours.
+
+        ``active_content="remove_auto_run"`` applies to every file, which must
+        then all be PDFs (see ``embed_document``).
         """
         files = _batch_files(items)
         if type(upload_concurrency) is not int or not 1 <= upload_concurrency <= 16:
             raise ValueError("upload_concurrency must be an integer from 1 to 16")
         key = _idempotency_key(idempotency_key)
         body = {"items": [{"filename": name, "size": size, "data": data} for name, _, size, data in files],
-                **_batch_options(archive, webhook_id, accelerator, storage_destination_id)}
+                **_batch_options(archive, webhook_id, accelerator, storage_destination_id, active_content)}
         # 503 means batch uploads are unavailable: raise at once (submit_batch_zip still works).
         response = self._request("watermarks/batches", "POST", True, retry=(429, 502, 504),
                                  headers={"Idempotency-Key": key}, json=body)
@@ -650,7 +678,8 @@ class Etchv:
 
     def submit_batch_zip(self, zip_file: bytes | str | os.PathLike[str], items: Sequence[ZipBatchItem], *,
                          archive: bool = False, webhook_id: str | None = None, accelerator: Accelerator | None = None,
-                         storage_destination_id: str | None = None, idempotency_key: str | None = None) -> Batch:
+                         storage_destination_id: str | None = None, idempotency_key: str | None = None,
+                         active_content: ActiveContent | None = None) -> Batch:
         """Create and start a batch from one zip (up to 55 MB) of files already together.
 
         ``items`` lists every member as ``{"filename": <exact member path>, "data": {...}}``;
@@ -666,7 +695,7 @@ class Etchv:
             if not isinstance(item, Mapping) or not isinstance(item.get("filename"), str) or not item["filename"]:
                 raise ValueError("Each zip item needs a filename (the member's path in the zip) and data")
             members.append({"filename": item["filename"], "data": _batch_data(item.get("data"), item["filename"])})
-        manifest = {"items": members, **_batch_options(archive, webhook_id, accelerator, storage_destination_id)}
+        manifest = {"items": members, **_batch_options(archive, webhook_id, accelerator, storage_destination_id, active_content)}
         response = self._request("watermarks/batches/zip", "POST", True, accept=(202,),
                                  headers={"Idempotency-Key": _idempotency_key(idempotency_key)},
                                  files={"archive": ("batch.zip", content, "application/zip")},
@@ -1005,9 +1034,18 @@ class Etchv:
 
     def embed_document(self, document: bytes, data: dict[str, Any], *, filename: str = "document.pdf",
                        idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None,
-                       accelerator: Accelerator | None = None) -> EmbedResult:
-        """Watermark a PDF, DOCX or PPTX and wait for the verified file (see ``embed_image``)."""
-        return self._embed_media("documents", document, data, filename, idempotency_key, storage_destination_id, storage_key, accelerator)
+                       accelerator: Accelerator | None = None, active_content: ActiveContent | None = None) -> EmbedResult:
+        """Watermark a PDF, DOCX or PPTX and wait for the verified file (see ``embed_image``).
+
+        PDFs take 1 to 2,000 pages and up to 50 MB; DOCX and PPTX up to 20 MB.
+        The watermarked PDF must fit in 95 MB with about 48 KB per page, so a
+        2,000-page PDF can be about 1 MB. ``active_content="remove_auto_run"``
+        removes what a PDF viewer runs by itself (open actions, document-level
+        JavaScript, XFA); ``"keep"``, the default, returns scripts and actions
+        as uploaded. The API refuses ``"remove_auto_run"`` for DOCX and PPTX.
+        """
+        return self._embed_media("documents", document, data, filename, idempotency_key, storage_destination_id, storage_key, accelerator,
+                                 active_content)
 
     def embed_video(self, video: bytes, data: dict[str, Any], *, filename: str = "video.mp4",
                     idempotency_key: str | None = None, storage_destination_id: str | None = None, storage_key: str | None = None,
@@ -1017,11 +1055,12 @@ class Etchv:
 
     def _embed_media(self, media: str, image: bytes, data: dict[str, Any], filename: str,
                      idempotency_key: str | None, destination: str | None, storage_key: str | None,
-                     accelerator: Accelerator | None) -> EmbedResult:
+                     accelerator: Accelerator | None, active_content: ActiveContent | None = None) -> EmbedResult:
         if not isinstance(data, dict) or not data:
             raise ValueError("data must be a non-empty JSON object")
         encoded = json.dumps(data, allow_nan=False)
         path = self._accelerator_path(self._storage_path(f"watermarks/{media}", destination, storage_key), accelerator)
+        path = self._active_content_path(path, media, active_content)
         response = self._post(path, image, filename, {"data": encoded}, idempotency_key)
         return self._embedding_result(response)
 
@@ -1189,7 +1228,7 @@ def _batch_files(items: Any) -> list[tuple[str, Any, int, dict[str, Any]]]:
 
 
 def _batch_options(archive: bool, webhook_id: str | None, accelerator: Accelerator | None,
-                   storage_destination_id: str | None) -> dict[str, Any]:
+                   storage_destination_id: str | None, active_content: ActiveContent | None) -> dict[str, Any]:
     if type(archive) is not bool:
         raise ValueError("archive must be a boolean")
     options: dict[str, Any] = {"archive": archive}
@@ -1197,9 +1236,11 @@ def _batch_options(archive: bool, webhook_id: str | None, accelerator: Accelerat
         _check_id(webhook_id, r"wh_[a-f0-9]{32}", "webhook ID")
         options["webhook_id"] = webhook_id
     if accelerator is not None:
-        if accelerator not in ("cpu", "gpu"):
-            raise ValueError('accelerator must be "cpu" or "gpu"')
+        _choice("accelerator", accelerator, _ACCELERATORS)
         options["accelerator"] = accelerator
+    if active_content is not None:
+        _choice("active_content", active_content, _ACTIVE_CONTENT)
+        options["active_content"] = active_content
     if storage_destination_id is not None:
         if archive:
             raise ValueError("archive and storage_destination_id cannot be combined")
@@ -1247,11 +1288,12 @@ def _batch(payload: Any, response: httpx.Response) -> Batch:
         upload_expires_at=_optional_str(payload.get("upload_expires_at")),
         status_url=_optional_str(payload.get("status_url")) or f"/watermarks/batches/{payload['batch_id']}",
         archive_status=_optional_str(payload.get("archive_status")), archive_url=_optional_str(payload.get("archive_url")),
-        archive_expires_at=_optional_str(payload.get("archive_expires_at")), items=tuple(entries))
+        archive_expires_at=_optional_str(payload.get("archive_expires_at")), items=tuple(entries),
+        active_content=payload["active_content"] if payload.get("active_content") in _ACTIVE_CONTENT else None)
 
 
 def _accelerator(value: Any) -> Accelerator | None:
-    return value if value in ("cpu", "gpu") else None
+    return value if value in _ACCELERATORS else None
 
 
 def _retry_after(value: str | None) -> float | None:

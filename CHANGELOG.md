@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.0
+
+- `embed_document`, `submit_embed("documents", ...)`, `submit_batch` and
+  `submit_batch_zip` take `active_content` (`"keep"`, the default, or
+  `"remove_auto_run"`) to remove what a PDF viewer runs by itself. The new
+  `ActiveContent` type names the values, and `Batch.active_content` reports a
+  batch's choice. Other media raise `ValueError`.
+- The README states the PDF limits: 1 to 2,000 pages and 50 MB to embed, 95 MB
+  for the watermarked copy (48 KB per page) and 95 MB to detect.
+
 ## 1.3.0
 
 - `embed_video` and `detect_video` results can now be WebM, Matroska (`.mkv`),

@@ -34,9 +34,12 @@ with Etchv(os.environ["ETCHV_API_KEY"]) as client:
 Use `embed_document` / `detect_document` for PDF, DOCX and PPTX and
 `embed_video` / `detect_video` for MP4, MOV, WebM, Matroska, MPEG and AVI
 ([supported codecs](https://etchv.com/docs/api/videos#supported-files)). Image
-uploads are limited to 50 MB; document and video uploads to 20 MB. Detection takes the files Etchv delivered: up to 192 MB
-for images, 64 MB for PDFs and 100 MB for DOCX, PPTX and video. Detection
-recovers a SHA-256 digest of your data, not the data itself.
+and PDF uploads are limited to 50 MB; DOCX, PPTX and video uploads to 20 MB. A
+PDF has 1 to 2,000 pages, and its watermarked copy must fit in 95 MB with 48 KB
+per page, so a 2,000-page PDF can be up to about 1 MB. Detection takes the files
+Etchv delivered: up to 192 MB for images, 95 MB for PDFs and 100 MB for DOCX,
+PPTX and video. Detection recovers a SHA-256 digest of your data, not the data
+itself.
 
 ## Large files
 
@@ -50,6 +53,23 @@ explicitly:
 ```python
 upload = client.upload_file("detect", delivered, filename="delivered.tiff")
 upload["upload_id"]  # send as the upload_id form field instead of file
+```
+
+## PDF scripts and actions
+
+A watermarked PDF keeps its scripts, actions, form fields and attachments
+exactly as uploaded. Pass `active_content="remove_auto_run"` to
+`embed_document`, `submit_embed("documents", ...)`, `submit_batch` or
+`submit_batch_zip` to also remove what a PDF viewer runs by itself: the open
+action, document and page actions, document-level JavaScript and XFA forms.
+Links, form fields and attachments stay. `"remove_auto_run"` is for PDFs only:
+the API refuses it for a DOCX or PPTX, and for a batch unless every file is a
+PDF. Keeping active content is accepted for any document and any batch.
+[Scripts and actions](https://etchv.com/docs/api/documents#scripts-and-actions).
+
+```python
+result = client.embed_document(Path("contract.pdf").read_bytes(), {"recipient": "counsel-7"},
+                               filename="contract.pdf", active_content="remove_auto_run")
 ```
 
 ## GPU processing
@@ -116,7 +136,7 @@ to a path or file object; `download_batch_archive` returns it as bytes.
 More than 100 items raise `ValueError` before any request; split larger sets
 into several batches. Pass `webhook_id` to get one `watermark.batch.completed`,
 `watermark.batch.failed` or `watermark.batch.cancelled` event when the batch
-ends, and `accelerator` or `storage_destination_id` as for single files.
+ends, and `accelerator`, `storage_destination_id` or `active_content` as for single files.
 Retries reuse the same `idempotency_key` (generated when omitted). If an upload
 or the start still fails, `BatchSubmitError` carries `batch_id` and
 `idempotency_key`; calling `submit_batch` again with that key and the same items

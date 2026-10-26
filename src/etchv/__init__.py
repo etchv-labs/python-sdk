@@ -2,6 +2,7 @@
 from .client import (
     __version__,
     Accelerator,
+    ActiveContent,
     AuthenticationError,
     Batch,
     BatchEntry,
@@ -32,6 +33,7 @@ __all__ = [
     "__version__",
     "Etchv",
     "Accelerator",
+    "ActiveContent",
     "EtchvError",
     "AuthenticationError",
     "PaymentRequiredError",
