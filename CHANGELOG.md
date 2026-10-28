@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.0
+
+- Traceable links: `create_link` shares a source asset so each recipient
+  downloads their own watermarked copy, with `recipients` or
+  `allowed_domains`, `expires_at`, `prepare`, `download_limit` and
+  `webhook_id`. Retries reuse one `Idempotency-Key`. Also `estimate_link`,
+  `list_links`, `get_link`, `list_link_events` and `revoke_link`, and the
+  `LinkPrepare` type.
+- `DetectionResult.copy` names the traceable link copy a watermark is on (link,
+  recipient, first open) and `DetectionResult.asset` another watermarked asset
+  of yours, when your key may read them; both are `None` otherwise.
+
 ## 1.4.0
 
 - `embed_document`, `submit_embed("documents", ...)`, `submit_batch` and

@@ -12,14 +12,15 @@ from pathlib import Path
 from uuid import uuid4
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from email.utils import parsedate_to_datetime
 from typing import Any, BinaryIO, Literal, TypedDict
 from urllib.parse import urlsplit, urlencode
 
 import httpx
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 USER_AGENT = f"etchv-python/{__version__}"
 
 Accelerator = Literal["cpu", "gpu"]
@@ -30,6 +31,11 @@ ActiveContent = Literal["keep", "remove_auto_run"]
 """What PDF watermarking does with scripts and actions: ``"keep"`` (default) returns them as
 uploaded; ``"remove_auto_run"`` removes what a viewer runs by itself. PDF only."""
 _ACTIVE_CONTENT = ("keep", "remove_auto_run")
+
+LinkPrepare = Literal["on_open", "on_create"]
+"""When a traceable link makes its copies: ``"on_open"`` as each recipient first opens it, or
+``"on_create"`` all at once when the link is created. The API picks one when omitted."""
+_LINK_PREPARE = ("on_open", "on_create")
 
 
 def _choice(name: str, value: str | None, choices: tuple[str, ...]) -> None:
@@ -223,6 +229,12 @@ class DetectionResult:
     units: tuple[DetectionUnit, ...] = ()
     accelerator: Accelerator | None = None
     """Hardware that ran detection (``"cpu"`` or ``"gpu"``), when reported."""
+    copy: dict[str, Any] | None = field(default=None, hash=False)
+    """The traceable link copy the watermark is on: ``asset_id``, ``link`` (``id``, ``name``),
+    ``recipient`` and ``opened_at``. ``None`` when it isn't on one, or the key lacks ``links:read``."""
+    asset: dict[str, Any] | None = field(default=None, hash=False)
+    """Another of your watermarked assets the watermark is on: ``asset_id``, ``name``,
+    ``metadata`` and ``created_at``. ``None`` when it isn't on one, or the key lacks ``assets:read``."""
 
 
 BatchStatus = Literal["draft", "starting", "processing", "assembling", "completed", "failed", "cancelled", "expired"]
@@ -856,6 +868,69 @@ class Etchv:
         return BatchPage(tuple(_batch(entry, response) for entry in payload["data"]),
                          cursor if isinstance(cursor, str) else None)
 
+    # Traceable links
+
+    @staticmethod
+    def _link_path(link_id: str) -> str:
+        _check_id(link_id, r"lnk_[a-f0-9]{32}", "link ID")
+        return f"links/{link_id}"
+
+    def create_link(self, asset_id: str, name: str, *, recipients: Sequence[str] | None = None,
+                    allowed_domains: Sequence[str] | None = None, expires_at: datetime | str | None = None,
+                    prepare: LinkPrepare | None = None, download_limit: int | None = None,
+                    webhook_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Share a source asset so each recipient downloads their own watermarked copy (``links:write``).
+
+        Give ``recipients`` (up to 100 emails) or ``allowed_domains`` (up to 10). Send the
+        returned ``url`` to your recipients yourself. Raises ``PaymentRequiredError`` when the
+        workspace lacks the credits for the copies. Retries reuse one ``idempotency_key``
+        (generated when omitted), so a retry returns the same link.
+        """
+        body = _link_body(asset_id, name, recipients, allowed_domains, expires_at, prepare, download_limit, webhook_id)
+        response = self._request("links", "POST", True, headers={"Idempotency-Key": _idempotency_key(idempotency_key)},
+                                 json=body)
+        return _response_json(response)
+
+    def estimate_link(self, asset_id: str, name: str, *, recipients: Sequence[str] | None = None,
+                      allowed_domains: Sequence[str] | None = None, expires_at: datetime | str | None = None,
+                      prepare: LinkPrepare | None = None, download_limit: int | None = None,
+                      webhook_id: str | None = None) -> dict[str, Any]:
+        """Run every check of ``create_link`` without creating anything, and report the credits its
+        copies would take (``estimated_credits``) and how many are available (``links:write``)."""
+        body = _link_body(asset_id, name, recipients, allowed_domains, expires_at, prepare, download_limit, webhook_id)
+        return self._json("links/estimate", "POST", json=body)
+
+    def list_links(self, *, limit: int = 20, before: str | None = None) -> dict[str, Any]:
+        """List links newest first, without recipients (``links:read``). Returns ``data`` and
+        ``next_cursor``; pass it as ``before`` for the next page."""
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("limit must be an integer from 1 to 50")
+        params: dict[str, Any] = {"limit": limit}
+        if before is not None:
+            _check_id(before, r"lnk_[a-f0-9]{32}", "link cursor")
+            params["before"] = before
+        return self._json("links", params=params)
+
+    def get_link(self, link_id: str) -> dict[str, Any]:
+        """Read a link with each recipient, their opens and downloads, and their copy (``links:read``)."""
+        return self._json(self._link_path(link_id))
+
+    def list_link_events(self, link_id: str, *, limit: int = 50, before: str | None = None) -> dict[str, Any]:
+        """List a link's opens, downloads and locks newest first (``links:read``). Returns ``data``
+        and ``next_cursor``; pass it as ``before`` for the next page."""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        params: dict[str, Any] = {"limit": limit}
+        if before is not None:
+            _check_id(before, r"lev_[a-f0-9]{32}", "event cursor")
+            params["before"] = before
+        return self._json(self._link_path(link_id) + "/events", params=params)
+
+    def revoke_link(self, link_id: str) -> dict[str, Any]:
+        """Stop new opens and downloads at once (``links:write``). Copies not yet queued are
+        canceled; downloaded copies keep their watermark. Calling again returns the link."""
+        return self._json(self._link_path(link_id) + "/revoke", "POST")
+
     # Assets
 
     @staticmethod
@@ -1132,7 +1207,9 @@ class Etchv:
                 raise EtchvError(200, "Invalid detection units", response.headers.get("x-request-id"))
             units.append(DetectionUnit(index, unit["watermarked"], unit["confidence"], unit.get("watermark_id"), unit.get("part")))
         accelerator = _accelerator(response.headers.get("x-etchv-accelerator")) or _accelerator(result.get("accelerator"))
-        return DetectionResult(detected, confidence, identifier, response.headers.get("x-request-id"), tuple(units), accelerator)
+        record = {key: result.get(key) if isinstance(result.get(key), dict) else None for key in ("copy", "asset")}
+        return DetectionResult(detected, confidence, identifier, response.headers.get("x-request-id"), tuple(units), accelerator,
+                               **record)
 
 
 def _check_id(value: Any, pattern: str, label: str) -> None:
@@ -1175,6 +1252,40 @@ def _submit_error(error: BaseException, batch_id: str, key: str, code: str, what
         detail.update(index=index, filename=filename)
     return BatchSubmitError(status, {"detail": detail}, getattr(error, "request_id", None),
                             retry_after=getattr(error, "retry_after", None))
+
+
+def _link_body(asset_id: Any, name: Any, recipients: Any, allowed_domains: Any, expires_at: Any,
+               prepare: Any, download_limit: Any, webhook_id: Any) -> dict[str, Any]:
+    _check_id(asset_id, r"ast_[a-f0-9]{64}", "asset ID")
+    if not isinstance(name, str) or not name.strip() or len(name) > 200:
+        raise ValueError("name must be 1–200 characters")
+    if (recipients is None) == (allowed_domains is None):
+        raise ValueError("Give either recipients or allowed_domains")
+    audience = recipients if recipients is not None else allowed_domains
+    if isinstance(audience, str) or not isinstance(audience, Sequence) or not audience \
+            or not all(isinstance(value, str) for value in audience):
+        raise ValueError("recipients or allowed_domains must be a non-empty list of strings")
+    body: dict[str, Any] = {"asset_id": asset_id, "name": name,
+                            "recipients" if recipients is not None else "allowed_domains": list(audience)}
+    if isinstance(expires_at, datetime):
+        if expires_at.tzinfo is None:
+            raise ValueError("expires_at needs a time zone")
+        body["expires_at"] = expires_at.isoformat()
+    elif expires_at is not None:
+        if not isinstance(expires_at, str):
+            raise ValueError("expires_at must be a datetime or an ISO 8601 string")
+        body["expires_at"] = expires_at
+    _choice("prepare", prepare, _LINK_PREPARE)
+    if prepare is not None:
+        body["prepare"] = prepare
+    if download_limit is not None:
+        if type(download_limit) is not int or not 1 <= download_limit <= 100:
+            raise ValueError("download_limit must be an integer from 1 to 100")
+        body["download_limit"] = download_limit
+    if webhook_id is not None:
+        _check_id(webhook_id, r"wh_[a-f0-9]{32}", "webhook ID")
+        body["webhook_id"] = webhook_id
+    return body
 
 
 def _batch_path(batch_id: str) -> str:

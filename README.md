@@ -154,6 +154,32 @@ Also: `get_batch`, `cancel_batch` (files still waiting are canceled and
 refunded; queued and running files finish) and
 `list_batches(limit=20, before=...)`.
 
+## Traceable links
+
+Share one file so each recipient downloads their own watermarked copy. Use the
+source asset of a file you've watermarked; send the returned `url` yourself.
+
+```python
+link = client.create_link(
+    result.source_asset_id,
+    "Board pack, October",
+    recipients=["alex@example.com", "sam@example.com"],
+    download_limit=3,
+)
+print(link["url"])
+```
+
+Give `allowed_domains=["example.com"]` instead of `recipients` to let anyone at
+those domains open it. `estimate_link` takes the same arguments and reports the
+credits the copies would take without creating anything. Also `get_link` (each
+recipient, their opens and their copy), `list_links`, `list_link_events` and
+`revoke_link`.
+
+When a detected file is one of your links' copies, `DetectionResult.copy` names
+the link, the recipient and when they first opened it (needs `links:read`);
+`DetectionResult.asset` names any other watermarked asset of yours (needs
+`assets:read`). See https://etchv.com/docs/api/links.
+
 ## Also included
 
 - API key check: `check_api_key()` (no credits used).
