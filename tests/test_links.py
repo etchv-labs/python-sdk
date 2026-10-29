@@ -4,12 +4,13 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from etchv import Etchv, PaymentRequiredError
+from etchv import Etchv, NotFoundError, PaymentRequiredError, PermissionDeniedError
 
 AST = 'ast_' + 'e' * 64
 LNK = 'lnk_' + 'a' * 32
 LEV = 'lev_' + 'b' * 32
 WH = 'wh_' + 'c' * 32
+LRC = 'lrc_' + 'd' * 32
 WID = 'ab' * 32
 LINK = {'id': LNK, 'url': 'https://etchv.com/l/Yp3kQ8vN2rT6wX1zA4bC7d', 'name': 'Board pack', 'status': 'active', 'recipients': []}
 
@@ -100,6 +101,33 @@ class LinkTests(unittest.TestCase):
             ('GET', f'/links/{LNK}/events', {'limit': '50', 'before': LEV}, None),
             ('POST', f'/links/{LNK}/revoke', {}, None),
         ])
+
+    def test_delete_and_remove_a_recipient(self):
+        seen = []
+        def handle(request):
+            seen.append((request.method, request.url.path))
+            if request.url.path == f'/links/{LNK}':
+                return httpx.Response(204)
+            return httpx.Response(200, json={**LINK, 'recipients': []})
+        with client(handle) as sdk:
+            self.assertIsNone(sdk.delete_link(LNK))
+            self.assertEqual(sdk.remove_link_recipient(LNK, LRC)['recipients'], [])
+        self.assertEqual(seen, [('DELETE', f'/links/{LNK}'), ('DELETE', f'/links/{LNK}/recipients/{LRC}')])
+
+    def test_delete_refusals(self):
+        with client(lambda r: httpx.Response(404, json={'detail': 'Link not found'})) as sdk:
+            with self.assertRaises(NotFoundError):
+                sdk.remove_link_recipient(LNK, LRC)
+        with client(lambda r: httpx.Response(403, json={'detail': 'needs assets:delete'})) as sdk:
+            with self.assertRaises(PermissionDeniedError):
+                sdk.delete_link(LNK)
+        def handle(request):
+            raise AssertionError('no request expected')
+        with client(handle) as sdk:
+            for call in [lambda: sdk.delete_link('lnk_1'), lambda: sdk.remove_link_recipient(LNK, 'lrc_1'),
+                         lambda: sdk.remove_link_recipient('lnk_1', LRC), lambda: sdk.remove_link_recipient(LNK, LNK)]:
+                with self.assertRaises(ValueError):
+                    call()
 
 
 class DetectionRecordTests(unittest.TestCase):

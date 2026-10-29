@@ -20,7 +20,7 @@ from urllib.parse import urlsplit, urlencode
 
 import httpx
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 USER_AGENT = f"etchv-python/{__version__}"
 
 Accelerator = Literal["cpu", "gpu"]
@@ -930,6 +930,21 @@ class Etchv:
         """Stop new opens and downloads at once (``links:write``). Copies not yet queued are
         canceled; downloaded copies keep their watermark. Calling again returns the link."""
         return self._json(self._link_path(link_id) + "/revoke", "POST")
+
+    def delete_link(self, link_id: str) -> None:
+        """Delete a link with every recipient's opens, downloads and copy (``links:write`` and
+        ``assets:delete``, owner/admin). The link stops at once, as on a revoke. This can't be
+        undone, and detection no longer names the link's recipients. Calling again succeeds too."""
+        self._request(self._link_path(link_id), "DELETE", False)
+
+    def remove_link_recipient(self, link_id: str, recipient_id: str) -> dict[str, Any]:
+        """Delete one recipient's opens, downloads and copy, for example when they ask to be erased
+        (``links:write`` and ``assets:delete``, owner/admin). Returns the link without them. This
+        can't be undone, and detection no longer names the recipient. ``recipient_id`` is the
+        recipient's ``id`` from ``get_link``."""
+        path = self._link_path(link_id)
+        _check_id(recipient_id, r"lrc_[a-f0-9]{32}", "recipient ID")
+        return self._json(path + f"/recipients/{recipient_id}", "DELETE")
 
     # Assets
 

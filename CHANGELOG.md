@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.0
+
+- `delete_link` deletes a traceable link with every recipient's opens,
+  downloads and copy; `remove_link_recipient` deletes one recipient's
+  records and copy and returns the link without them. Each recipient in `get_link` now has an `id`
+  (`lrc_...`). Both need an owner or admin and, for an API key, the
+  `assets:delete` scope as well as `links:write`.
+
 ## 1.5.0
 
 - Traceable links: `create_link` shares a source asset so each recipient
