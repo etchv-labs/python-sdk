@@ -56,6 +56,16 @@ def clock():
     return mock.patch('etchv.client.time.monotonic', side_effect=lambda: next(ticks))
 
 
+class Dropped(httpx.SyncByteStream):
+    """A response body that breaks off after ``head``, as a reset connection does."""
+    def __init__(self, head):
+        self.head = head
+
+    def __iter__(self):
+        yield self.head
+        raise httpx.ReadError('connection reset')
+
+
 @mock.patch('etchv.client.time.sleep')
 class BatchTests(unittest.TestCase):
     def test_create_upload_start_without_the_api_key_on_uploads(self, sleep):
@@ -377,6 +387,45 @@ class BatchTests(unittest.TestCase):
                     sdk.download_batch_archive_to(BATCH, Path(folder, 'out.zip'))
             self.assertEqual(list(Path(folder).iterdir()), [])
         self.assertEqual((error.exception.code, len(calls)), ('archive_too_large', 1))
+
+    def test_a_dropped_archive_starts_again_from_the_beginning(self, sleep):
+        big = ZIP + b'q' * (3 * 1024 * 1024)
+        calls = []
+        def handle(request):
+            calls.append(1)
+            self.assertNotIn('range', request.headers)
+            return httpx.Response(200, stream=Dropped(big[:1024 * 1024]) if len(calls) % 2 else httpx.ByteStream(big))
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder, 'out.zip')
+            with client(handle) as sdk:
+                self.assertEqual(sdk.download_batch_archive_to(BATCH, target), len(big))
+                self.assertEqual(sdk.download_batch_archive(BATCH), big)
+                sink = io.BytesIO(b'header')
+                sink.seek(0, io.SEEK_END)
+                self.assertEqual(sdk.download_batch_archive_to(BATCH, sink), len(big))
+            self.assertEqual(target.read_bytes(), big)
+            self.assertEqual(sink.getvalue(), b'header' + big)
+            self.assertEqual([p.name for p in Path(folder).iterdir()], ['out.zip'])
+        self.assertEqual(len(calls), 6)
+
+    def test_a_dropped_archive_into_an_unseekable_stream_raises(self, sleep):
+        class Pipe(io.RawIOBase):
+            def __init__(self):
+                self.received = b''
+            def writable(self):
+                return True
+            def write(self, data):
+                self.received += bytes(data)
+                return len(data)
+        calls = []
+        def handle(request):
+            calls.append(1)
+            return httpx.Response(200, stream=Dropped(ZIP))
+        pipe = Pipe()
+        with client(handle) as sdk:
+            with self.assertRaises(httpx.ReadError):
+                sdk.download_batch_archive_to(BATCH, pipe)
+        self.assertEqual((pipe.received, len(calls)), (ZIP, 1))
 
     def test_a_failed_archive_download_leaves_no_partial_file(self, sleep):
         with tempfile.TemporaryDirectory() as folder:

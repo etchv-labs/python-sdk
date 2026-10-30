@@ -6,7 +6,7 @@ import io
 import json
 import os
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from uuid import uuid4
@@ -20,7 +20,7 @@ from urllib.parse import urlsplit, urlencode
 
 import httpx
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 USER_AGENT = f"etchv-python/{__version__}"
 
 Accelerator = Literal["cpu", "gpu"]
@@ -55,7 +55,10 @@ class EtchvError(RuntimeError):
     plain-text ``detail``); otherwise they are ``None``. A structured
     ``message`` is included in the exception text. ``retry_after`` is the
     ``Retry-After`` delay in seconds, or ``None`` when the response sent none.
-    The exception text never contains the API key or the raw response body.
+    ``idempotency_key`` is the key a keyed request (embedding, a job or a
+    detection) was sent with: resend with it to get the same result without a
+    second charge. The exception text never contains the API key or the raw
+    response body.
     """
 
     def __init__(self, status_code: int, detail: Any, request_id: str | None = None, *,
@@ -77,6 +80,7 @@ class EtchvError(RuntimeError):
         self.detail = detail
         self.request_id = request_id
         self.retry_after = retry_after
+        self.idempotency_key: str | None = None
 
 
 class AuthenticationError(EtchvError):
@@ -112,7 +116,8 @@ class RateLimitError(EtchvError):
 
 
 class DeadlineExceededError(EtchvError):
-    """The client ``timeout`` passed before a durable job finished (status 0).
+    """The client ``timeout`` passed before a durable job or a retried detection
+    finished (status 0).
 
     The job may still complete. ``detail`` contains the ``idempotency_key``
     and ``request_id`` (when known) for recovery.
@@ -137,7 +142,7 @@ class BatchSubmitError(EtchvError):
         inner = detail.get("detail") if isinstance(detail, dict) else None
         inner = inner if isinstance(inner, dict) else {}
         self.batch_id: str | None = inner.get("batch_id")
-        self.idempotency_key: str | None = inner.get("idempotency_key")
+        self.idempotency_key = inner.get("idempotency_key")
         self.index: int | None = inner.get("index")
         self.filename: str | None = inner.get("filename")
 
@@ -359,6 +364,8 @@ EMBED_MAX_BYTES = 50 * MB
 DETECT_MAX_BYTES = 192 * MB
 SYNC_DETECT_MAX_BYTES = 95 * MB
 _UPLOAD_KINDS = {"images": "image", "documents": "document", "videos": "video"}
+_REPLAYABLE = ("watermarks/images/detect", "watermarks/documents/detect")
+"""Detections answered in the request: the API replays them for the same ``Idempotency-Key``."""
 
 
 class Etchv:
@@ -414,35 +421,69 @@ class Etchv:
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
         durable = path.split("?")[0].endswith("/async") or path.split("?")[0] in ("watermarks/images", "watermarks/documents", "watermarks/videos", "watermarks/videos/detect")
-        if durable and not idempotency_key:
+        resend = route in _REPLAYABLE
+        if (durable or resend) and not idempotency_key:
             headers["Idempotency-Key"] = uuid4().hex
         if len(image) > self._large_file_threshold:
             # Too large for one request body: upload once, then every retry sends the same upload_id.
             kind = "detect" if detect else _UPLOAD_KINDS[route.split("/")[1]]
-            upload = self.upload_file(kind, image, filename=filename)
-            return self._request(path, "POST", durable, headers=headers,
-                                 data={**(data or {}), "upload_id": upload["upload_id"]})
-        return self._request(path, "POST", durable, headers=headers,
+            deadline = None
+            def send() -> httpx.Response:
+                nonlocal deadline
+                upload = self.upload_file(kind, image, filename=filename)
+                deadline = deadline or time.monotonic() + self._timeout
+                # A resend can find the first copy still holding this upload: wait as for request_in_progress.
+                return self._request(path, "POST", durable, resend=resend, deadline=deadline, headers=headers,
+                                     busy=("request_in_progress", "upload_in_use"),
+                                     data={**(data or {}), "upload_id": upload["upload_id"]})
+            try:
+                try:
+                    return send()
+                except ConflictError as error:
+                    if not resend or error.code != "upload_consumed":
+                        raise
+                # A dropped detection consumed the upload and kept no result (keep_result=False): the API
+                # re-runs it on the same bytes, so upload them again and resend with the same key, within
+                # the first send's deadline.
+                return send()
+            except (EtchvError, httpx.TransportError) as error:
+                # Upload failures too, including a network error from the upload itself: resend with this key.
+                error.idempotency_key = headers["Idempotency-Key"]
+                raise
+        return self._request(path, "POST", durable, resend=resend, headers=headers,
                              files={"file": (filename, image, "application/octet-stream")}, data=data)
 
     def _request(self, path: str, method: str, durable: bool, *, accept: tuple[int, ...] = (),
-                 retry: tuple[int, ...] = (429, 502, 503, 504), **kwargs: Any) -> httpx.Response:
+                 retry: tuple[int, ...] = (429, 502, 503, 504), resend: bool = False,
+                 busy: tuple[str, ...] = ("request_in_progress",), deadline: float | None = None,
+                 **kwargs: Any) -> httpx.Response:
+        # ``resend`` is for a request the API answers the same way twice (a GET download, or an
+        # instant detection with its Idempotency-Key): it is sent again after a dropped connection
+        # and while the API answers 409 with a ``busy`` code (the first copy is still running),
+        # but no error status is retried.
         async_submission = path.split("?")[0].endswith("/async")
         detection_job = path.split("?")[0] == "watermarks/videos/detect" or "detection-jobs/" in path
-        deadline = time.monotonic() + self._timeout
+        deadline = deadline or time.monotonic() + self._timeout
         match = re.search(r"watermarks/(?:detection-)?jobs/(req_[a-f0-9]{64})", path)
         request_id = match.group(1) if match else None
         idempotency_key = kwargs.get("headers", {}).get("Idempotency-Key")
         def pause(seconds: float = 1) -> None:
             time.sleep(min(seconds, max(0, deadline - time.monotonic())))
+        dropped = None
         while time.monotonic() < deadline:
             try:
                 response = self._client.request(method, path, timeout=max(.001, deadline - time.monotonic()), **kwargs)
-            except httpx.TransportError:
-                if not durable:
+            except httpx.TransportError as error:
+                if not (durable or resend):
+                    raise
+                # A download out of time raises the dropped connection; a keyed request ends with
+                # DeadlineExceededError and its key.
+                dropped = None if durable or idempotency_key else error
+                if dropped and time.monotonic() + 1 >= deadline:
                     raise
                 pause()
                 continue
+            dropped = None
             request_id = response.headers.get("x-request-id") or request_id
             if (response.status_code in (200, 201, 204) or response.status_code in accept
                     or (async_submission and response.status_code == 202)):
@@ -463,12 +504,23 @@ class Etchv:
                     delay = 1
                 pause(delay)
                 continue
+            if (resend and response.status_code == 409 and isinstance(detail, dict) and isinstance(detail.get("detail"), dict)
+                    and detail["detail"].get("code") in busy):
+                delay = _retry_after(response.headers.get("retry-after"))
+                pause(1 if delay is None else min(5, max(.01, delay)))
+                continue
             if durable and response.status_code in retry and not (isinstance(detail, dict) and detail.get("status") == "failed"):
                 delay = _retry_after(response.headers.get("retry-after")) if response.status_code == 429 else None
                 pause(1 if delay is None else min(5, max(.01, delay)))
                 continue
-            raise _error(response.status_code, detail, request_id, _retry_after(response.headers.get("retry-after")))
-        raise DeadlineExceededError(0, {"message": "Client deadline exceeded; the job may still complete", "idempotency_key": idempotency_key, "request_id": request_id}, request_id)
+            error = _error(response.status_code, detail, request_id, _retry_after(response.headers.get("retry-after")))
+            error.idempotency_key = idempotency_key
+            raise error
+        if dropped:
+            raise dropped
+        error = DeadlineExceededError(0, {"message": "Client deadline exceeded; the job may still complete", "idempotency_key": idempotency_key, "request_id": request_id}, request_id)
+        error.idempotency_key = idempotency_key
+        raise error
 
     def _json(self, path: str, method: str = "GET", *, accept: tuple[int, ...] = (), **kwargs: Any) -> Any:
         response = self._request(path, method, False, accept=accept, **kwargs)
@@ -767,7 +819,9 @@ class Etchv:
 
         The zip holds every successful result plus ``manifest.json`` listing
         files and failures. It can reach 1 GB: use ``download_batch_archive_to``
-        to stream it to a file instead of holding it in memory. Raises
+        to stream it to a file instead of holding it in memory. A connection
+        dropped mid-download starts the download again from the beginning
+        until ``timeout`` passes (the archive route does not resume). Raises
         ``ConflictError`` (``code`` ``archive_not_requested``,
         ``batch_not_started``, ``archive_too_large`` or ``archive_unavailable``),
         ``GoneError`` after 24 hours or for an expired draft, and
@@ -776,7 +830,7 @@ class Etchv:
         ``archive_too_large`` and is not retried.
         """
         buffer = io.BytesIO()
-        self._stream_archive(batch_id, timeout, buffer.write)
+        self._stream_archive(batch_id, timeout, buffer.write, _rewind(buffer))
         return buffer.getvalue()
 
     def download_batch_archive_to(self, batch_id: str, destination: str | os.PathLike[str] | BinaryIO, *,
@@ -786,21 +840,25 @@ class Etchv:
 
         A path is written through a ``.part`` file that replaces it only once the
         download is complete. Each network read may take up to the client
-        ``timeout``; the download as a whole has no time limit.
+        ``timeout``; the download as a whole has no time limit. After a dropped
+        connection the ``.part`` file, or a seekable file object, is truncated
+        back to where the download began and the zip is streamed again. A file
+        object that cannot seek (a pipe or socket) already passed the bytes on,
+        so the error is raised instead.
         """
         if not isinstance(destination, (str, os.PathLike)):
-            return self._stream_archive(batch_id, timeout, destination.write)
+            return self._stream_archive(batch_id, timeout, destination.write, _rewind(destination))
         target = Path(destination)
         partial = target.with_name(target.name + ".part")
         try:
             with partial.open("wb") as handle:
-                written = self._stream_archive(batch_id, timeout, handle.write)
+                written = self._stream_archive(batch_id, timeout, handle.write, _rewind(handle))
             os.replace(partial, target)
         finally:
             partial.unlink(missing_ok=True)
         return written
 
-    def _stream_archive(self, batch_id: str, timeout: float, write: Any) -> int:
+    def _stream_archive(self, batch_id: str, timeout: float, write: Any, rewind: Callable[[], None] | None) -> int:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be positive and finite")
         path = _batch_path(batch_id) + "/archive"
@@ -834,8 +892,11 @@ class Etchv:
                             detail = response.text[:1000]
                         raise _error(response.status_code, detail, request_id, retry_after)
             except httpx.TransportError:
-                if receiving or time.monotonic() >= deadline:
-                    raise  # Part of the archive may already be written: do not append a second copy.
+                if time.monotonic() >= deadline or (receiving and rewind is None):
+                    raise  # Part of the archive went where it cannot be taken back: do not append a second copy.
+                if receiving:
+                    # The archive route does not serve Range requests: drop what was written and start over.
+                    rewind()
                 delay = 1.0
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -983,8 +1044,11 @@ class Etchv:
         self._request("assets/bulk-delete", "POST", False, json={"asset_ids": list(asset_ids)})
 
     def download_asset(self, asset_id: str) -> bytes:
-        """Download an asset file in its original format. Raises ``GoneError`` when expired."""
-        return self._request(self._asset_path(asset_id) + "/content", "GET", False).content
+        """Download an asset file in its original format. Raises ``GoneError`` when expired.
+
+        A dropped connection is retried within the client ``timeout``.
+        """
+        return self._request(self._asset_path(asset_id) + "/content", "GET", False, resend=True).content
 
     # Webhooks
 
@@ -1104,8 +1168,11 @@ class Etchv:
         return self._json(self._delivery_path(delivery_id) + "/retry", "POST", accept=(202,))
 
     def download_storage_delivery(self, delivery_id: str) -> bytes:
-        """Download a stored object through Etchv (the delivery must be ``stored``)."""
-        return self._request(self._delivery_path(delivery_id) + "/content", "GET", False).content
+        """Download a stored object through Etchv (the delivery must be ``stored``).
+
+        A dropped connection is retried within the client ``timeout``.
+        """
+        return self._request(self._delivery_path(delivery_id) + "/content", "GET", False, resend=True).content
 
     # Synchronous watermarking
 
@@ -1167,18 +1234,37 @@ class Etchv:
 
     # Synchronous detection
 
-    def detect_image(self, image: bytes, *, filename: str = "image.png",
-                     idempotency_key: str | None = None, accelerator: Accelerator | None = None) -> DetectionResult:
-        """Detect a watermark in an image. Not retried automatically.
+    def detect_image(self, image: bytes, *, filename: str = "image.png", idempotency_key: str | None = None,
+                     accelerator: Accelerator | None = None, keep_result: bool | None = None) -> DetectionResult:
+        """Detect a watermark in an image.
 
-        ``accelerator="gpu"`` requests GPU processing (see ``embed_image``).
+        A dropped connection is retried with the same idempotency key
+        (generated when omitted) until ``timeout``, and so is a retry the API
+        reports as still running (409 ``request_in_progress``, or
+        ``upload_in_use`` while the first copy holds the file's upload). The API
+        returns the first result without charging again. Other errors are not
+        retried: 409 ``replay_expired`` or ``request_failed`` raise
+        ``ConflictError``. Every error, including ``DeadlineExceededError`` when
+        time runs out and a network error from the upload, carries the key as
+        ``idempotency_key``.
+
+        The API keeps the result 24 hours for those retries. With
+        ``keep_result=False`` it keeps nothing, and a retry runs detection again
+        on the resent file at no charge (a file that went through an upload is
+        uploaded again, bounded like any upload; the resend after it stays within
+        the ``timeout`` counted from the first send). ``accelerator="gpu"``
+        requests GPU processing (see ``embed_image``).
         """
-        return self._detect_media("images", image, filename, idempotency_key, accelerator)
+        return self._detect_media("images", image, filename, idempotency_key, accelerator, keep_result)
 
-    def detect_document(self, document: bytes, *, filename: str = "document.pdf",
-                        idempotency_key: str | None = None, accelerator: Accelerator | None = None) -> DetectionResult:
-        """Detect watermarks in a PDF (page by page), DOCX or PPTX. Not retried automatically."""
-        return self._detect_media("documents", document, filename, idempotency_key, accelerator)
+    def detect_document(self, document: bytes, *, filename: str = "document.pdf", idempotency_key: str | None = None,
+                        accelerator: Accelerator | None = None, keep_result: bool | None = None) -> DetectionResult:
+        """Detect watermarks in a PDF (page by page), DOCX or PPTX. Retried like ``detect_image``.
+
+        ``keep_result`` applies to detection answered in the request; a long PDF
+        runs as a job, which keeps its result like any job.
+        """
+        return self._detect_media("documents", document, filename, idempotency_key, accelerator, keep_result)
 
     def detect_video(self, video: bytes, *, filename: str = "video.mp4",
                      idempotency_key: str | None = None, accelerator: Accelerator | None = None) -> DetectionResult:
@@ -1186,12 +1272,16 @@ class Etchv:
         return self._detect_media("videos", video, filename, idempotency_key, accelerator)
 
     def _detect_media(self, media: str, image: bytes, filename: str, idempotency_key: str | None,
-                      accelerator: Accelerator | None) -> DetectionResult:
+                      accelerator: Accelerator | None, keep_result: bool | None = None) -> DetectionResult:
+        if keep_result is not None and type(keep_result) is not bool:
+            raise ValueError("keep_result must be a boolean")
         if media != "videos" and isinstance(image, bytes) and len(image) > SYNC_DETECT_MAX_BYTES:
             # Synchronous image and PDF detection stops at 95 MB; larger delivered files run as a job.
             receipt = self.submit_detection(media, image, filename=filename, idempotency_key=idempotency_key, accelerator=accelerator)
             return self.get_detection_result(receipt["request_id"])
         path = self._accelerator_path(f"watermarks/{media}/detect", accelerator)
+        if keep_result is not None:
+            path += ("&" if "?" in path else "?") + f"keep_result={str(keep_result).lower()}"
         return self._detection_result(self._post(path, image, filename, None, idempotency_key))
 
     def _detection_result(self, response: httpx.Response) -> DetectionResult:
@@ -1230,6 +1320,20 @@ class Etchv:
 def _check_id(value: Any, pattern: str, label: str) -> None:
     if not isinstance(value, str) or not re.fullmatch(pattern, value):
         raise ValueError(f"Invalid {label}")
+
+
+def _rewind(destination: BinaryIO) -> Callable[[], None] | None:
+    """Truncate a caller's file back to where the archive started, or ``None`` when it cannot seek."""
+    try:
+        start = destination.tell() if destination.seekable() else None
+    except (AttributeError, OSError):
+        start = None
+    if start is None:
+        return None
+    def rewind() -> None:
+        destination.seek(start)
+        destination.truncate(start)
+    return rewind
 
 
 def _write_zip(response: httpx.Response, write: Any, request_id: str | None) -> int:

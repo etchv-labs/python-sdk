@@ -131,7 +131,9 @@ requests. Files that never arrive or fail their checks are rejected
 files are refunded, so one bad file never stops the rest. Results are kept 24
 hours; the archive (with `archive=True`) holds every successful result plus
 `manifest.json` and is limited to 1 GB. `download_batch_archive_to` streams it
-to a path or file object; `download_batch_archive` returns it as bytes.
+to a path or file object; `download_batch_archive` returns it as bytes. If
+the connection drops mid-download, the download starts again from the
+beginning; a file object that cannot seek raises instead.
 
 More than 100 items raise `ValueError` before any request; split larger sets
 into several batches. Pass `webhook_id` to get one `watermark.batch.completed`,
@@ -212,6 +214,27 @@ errors also set `code` (for example `rate_limited` or `concurrency_limited`),
 the `Retry-After` seconds (`None` when not sent).
 Embedding, video detection and job calls retry HTTP 429, 502, 503 and 504
 within `timeout`, waiting for `Retry-After` (up to 5 seconds per wait) on 429.
+
+These calls also retry a dropped connection within `timeout`: embedding,
+`detect_video`, `submit_embed`, `submit_detection`, `get_embed_result`,
+`get_detection_result`, `submit_batch`, `submit_batch_zip`, `get_batch`,
+`wait_for_batch`, `cancel_batch`, `list_batches`, `create_link`, `detect_image`,
+`detect_document`, `download_asset`, `download_storage_delivery`,
+`download_batch_archive` and `download_batch_archive_to`. Other calls raise the
+`httpx` error.
+
+`detect_image` and `detect_document` resend with the same `idempotency_key`
+(generated when omitted), and the API returns the first result without
+charging again. A retry the API reports as still running (409
+`request_in_progress`, or `upload_in_use` for a file sent through an upload)
+waits and is sent again. The API keeps the result 24 hours for this; pass
+`keep_result=False` to keep nothing, and a retry then runs detection again at
+no charge, after the SDK uploads the file again if it went through an upload.
+The detection requests, resends included, stay within one `timeout` counted
+from the first send; uploading the file again is bounded like any upload.
+Errors from a keyed call carry its `idempotency_key`, and so does a network
+error from its upload, so you can resend it yourself. A batch archive starts again
+from the beginning.
 
 ```python
 from etchv import EtchvError
